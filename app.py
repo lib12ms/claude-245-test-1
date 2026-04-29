@@ -98,7 +98,7 @@ def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
         field += f" $b : {b_part}"
 
     if primary:
-        field += f" /$c {primary[0]['name']}"
+        field += f" /$d {primary[0]['name']}"
         for a in primary[1:]:
             field += f" ,$e {a['name']}"
         for label, names in role_groups.items():
@@ -107,7 +107,7 @@ def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
         field += "."
     elif role_groups:
         all_names = [name for names in role_groups.values() for name in names]
-        field += f" /$c {all_names[0]}"
+        field += f" /$d {all_names[0]}"
         for name in all_names[1:]:
             field += f" ,$e {name}"
         field += "."
@@ -200,8 +200,8 @@ def isbn_lookup():
     field_245 = build_245(title, subtitle, authors)
 
     persons    = [a for a in authors if not a["is_org"]]
-    fields_700 = [f"700 1_ {build_700(a)}" for a in persons[1:]]
-
+    fields_700 = [f"700 1_ {build_700(a)}" for a in persons]
+  
     orgs       = [a for a in authors if a["is_org"]]
     fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
 
