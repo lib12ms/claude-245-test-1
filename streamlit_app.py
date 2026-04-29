@@ -60,7 +60,6 @@ if "data" in st.session_state:
         st.markdown(f"**ISBN-13** `{data.get('isbn13', '—')}`")
 
     st.divider()
-
     st.info("✎ 표제·부제목을 수정하면 245 필드가 실시간으로 업데이트됩니다.")
 
     col_t, col_s = st.columns(2)
@@ -72,25 +71,26 @@ if "data" in st.session_state:
     authors = data.get("authors", [])
     PRIMARY = {"지은이", "저자", "글", "글쓴이", ""}
     ROLE_LABEL_MAP = {
-        "옮긴이":"옮긴이","역자":"옮긴이","번역":"옮긴이",
-        "그린이":"그린이","그림":"그린이","일러스트":"그린이",
-        "사진":"사진","감수":"감수","편저":"편저","편역":"편역",
-        "엮은이":"엮은이","편집":"엮은이","해설":"해설",
+        "옮긴이": "옮긴이", "역자": "옮긴이", "번역": "옮긴이",
+        "그린이": "그린이", "그림": "그린이", "일러스트": "그린이",
+        "사진": "사진", "감수": "감수", "편저": "편저", "편역": "편역",
+        "엮은이": "엮은이", "편집": "엮은이", "해설": "해설",
     }
 
-    persons   = [a for a in authors if not a.get("is_org")]
-    primary   = [a for a in persons if a.get("role", "") in PRIMARY]
+    persons = [a for a in authors if not a.get("is_org")]
+    primary = [a for a in persons if a.get("role", "") in PRIMARY]
     secondary = [a for a in persons if a.get("role", "") not in PRIMARY]
 
     role_groups = {}
     for a in secondary:
-        label = ROLE_LABEL_MAP.get(a.get("role",""), a.get("role",""))
+        label = ROLE_LABEL_MAP.get(a.get("role", ""), a.get("role", ""))
         role_groups.setdefault(label, []).append(a["name"])
 
     f245 = f"$a {edit_title}"
     if edit_subtitle:
         f245 += f" $b : {edit_subtitle}"
- if primary:
+
+    if primary:
         f245 += f" /$d {primary[0]['name']}"
         for a in primary[1:]:
             f245 += f" ,$e {a['name']}"
@@ -98,7 +98,7 @@ if "data" in st.session_state:
             for name in names:
                 f245 += f" ;$e {name}"
         f245 += "."
-elif role_groups:
+    elif role_groups:
         all_names = [n for ns in role_groups.values() for n in ns]
         f245 += f" /$d {all_names[0]}"
         for n in all_names[1:]:
