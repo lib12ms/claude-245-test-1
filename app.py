@@ -98,16 +98,16 @@ def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
         field += f" $b : {b_part}"
 
     if primary:
-        field += f" /$d {primary[0]['name']}"
+        f245 += f" /$d {primary[0]['name']}"
         for a in primary[1:]:
-            field += f" ,$e {a['name']}"
+            f245 += f" ,$e {a['name']}"
         for label, names in role_groups.items():
             for name in names:
                 field += f" ;$e {name}"
         field += "."
     elif role_groups:
-        all_names = [name for names in role_groups.values() for name in names]
-        field += f" /$d {all_names[0]}"
+        all_names = [n for ns in role_groups.values() for n in ns]
+        f245 += f" /$d {all_names[0]}"
         for name in all_names[1:]:
             field += f" ,$e {name}"
         field += "."
