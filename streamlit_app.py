@@ -33,13 +33,10 @@ if search and isbn_input:
         except Exception as e:
             st.error(f"서버 연결 오류: {e}")
             st.stop()
-
     if not resp.ok:
         st.error(data.get("error", "오류가 발생했습니다."))
         st.stop()
-
     st.session_state["data"] = data
-
 elif search and not isbn_input:
     st.warning("ISBN을 입력해 주세요.")
 
@@ -52,7 +49,6 @@ if "data" in st.session_state:
             st.image(data["cover"], width=150)
         else:
             st.markdown("_(표지 없음)_")
-
     with col_info:
         st.markdown(f"**저자** {data.get('author_raw', '—')}")
         st.markdown(f"**출판사** {data.get('publisher', '—')}")
@@ -90,27 +86,22 @@ if "data" in st.session_state:
     if edit_subtitle:
         f245 += f" $b : {edit_subtitle}"
 
-  if primary:
-        f245 += f" /$c {primary[0]['name']}"
+    if primary:
+        f245 += f" /$d {primary[0]['name']}"
         for a in primary[1:]:
             f245 += f" ,$e {a['name']}"
         for lbl, names in role_groups.items():
             for name in names:
                 f245 += f" ;$e {name}"
-        f245 += "."
-  elif role_groups:
+    elif role_groups:
         all_names = [n for ns in role_groups.values() for n in ns]
         f245 += f" /$d {all_names[0]}"
         for n in all_names[1:]:
             f245 += f" ,$e {n}"
-        f245 += "."
-    else:
-        f245 += "."
 
     f245_full = f"245 00 {f245}"
 
     st.divider()
-
     st.markdown("**245 00** — 표제와 책임표시사항")
     st.code(f245_full, language=None)
 
@@ -125,7 +116,6 @@ if "data" in st.session_state:
         st.code("\n".join(f710_list), language=None)
 
     st.divider()
-
     all_fields = [f245_full] + f700_list + f710_list
     st.text_area(
         "전체 MARC 필드 (복사용)",
