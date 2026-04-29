@@ -1,4 +1,2 @@
-flask>=3.0
-flask-cors>=4.0
+streamlit>=1.35
 requests>=2.31
-gunicorn>=21.0
