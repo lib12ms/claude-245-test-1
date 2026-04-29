@@ -90,15 +90,15 @@ if "data" in st.session_state:
     if edit_subtitle:
         f245 += f" $b : {edit_subtitle}"
 
-    if primary:
-        f245 += f" /$d {primary[0]['name']}"
+  if primary:
+        f245 += f" /$c {primary[0]['name']}"
         for a in primary[1:]:
             f245 += f" ,$e {a['name']}"
         for lbl, names in role_groups.items():
             for name in names:
                 f245 += f" ;$e {name}"
         f245 += "."
-    elif role_groups:
+  elif role_groups:
         all_names = [n for ns in role_groups.values() for n in ns]
         f245 += f" /$d {all_names[0]}"
         for n in all_names[1:]:
