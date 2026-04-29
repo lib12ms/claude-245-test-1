@@ -1,0 +1,5 @@
+# .streamlit/secrets.toml
+# Render에 배포된 Flask API 주소를 아래에 입력하세요.
+# Streamlit Cloud 배포 시에는 앱 설정 > Secrets 메뉴에서 동일하게 입력합니다.
+
+API_BASE = "https://your-render-app-name.onrender.com"

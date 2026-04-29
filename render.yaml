@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: kormarc-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ALADIN_API_KEY
+        value: ttbboyeong09010919001   # 실제 배포 시 Render 대시보드 환경변수로 관리 권장
