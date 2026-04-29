@@ -26,12 +26,15 @@ with col_btn:
 
 if search and isbn_input:
     isbn_clean = isbn_input.replace("-", "").replace(" ", "")
-    with st.spinner("알라딘 API에서 도서 정보를 가져오는 중..."):
+   with st.spinner("알라딘 API에서 도서 정보를 가져오는 중..."):
         try:
             resp = requests.get(f"{API_BASE}/api/isbn", params={"isbn": isbn_clean}, timeout=15)
+            st.write(f"HTTP 상태코드: {resp.status_code}")
+            st.write(f"응답 내용: {resp.text[:500]}")
             data = resp.json()
         except Exception as e:
             st.error(f"서버 연결 오류: {e}")
+            st.write(f"API_BASE 주소: {API_BASE}")
             st.stop()
     if not resp.ok:
         st.error(data.get("error", "오류가 발생했습니다."))
