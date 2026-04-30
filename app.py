@@ -3,6 +3,8 @@ from flask_cors import CORS
 import requests
 import re
 import os
+import urllib.request
+import urllib.error
 
 app = Flask(__name__)
 CORS(app)
@@ -46,39 +48,93 @@ def is_western(name):
 
 def invert_western(name):
     parts = name.strip().split()
-    if len(parts) >= 2:
-        return parts[-1] + ", " + " ".join(parts[:-1])
-    return name
+    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
 
 
 def invert_korean(name):
     parts = name.strip().split()
-    if len(parts) >= 2:
-        return parts[-1] + ", " + " ".join(parts[:-1])
-    return name
+    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
 
 
-def parse_authors(author_str):
+def extract_original_names_from_aladin_page(link, names):
     """
-    알라딘 author 문자열 파싱.
+    알라딘 상품 페이지와 저자 소개 페이지를 크롤링해서 원어명 추출.
+    예: '시그리드 누네즈 (Sigrid Nunez)' 패턴 감지
+    """
+    if not link or not names:
+        return {}
 
-    케이스 1 (원어명 있음):
-      디나라 미르탈리포바 (Dinara Mirtalipova) (그림)
-      → name: 디나라 미르탈리포바, original_name: Dinara Mirtalipova, role: 그림
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
 
-    케이스 2 (원어명 없음):
-      리베카 가딘 레빙턴 (지은이)
-      → name: 리베카 가딘 레빙턴, original_name: '', role: 지은이
+    result = {}
+    target_names = [n for n in names if not is_org(n)]
+
+    # 1차: 상품 페이지에서 직접 추출
+    try:
+        req = urllib.request.Request(link, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        for name in target_names:
+            pattern = re.compile(
+                rf"{re.escape(name)}\s*\(\s*([A-Za-z][A-Za-z .,'-]+)\s*\)",
+                re.IGNORECASE
+            )
+            match = pattern.search(html)
+            if match:
+                result[name] = match.group(1).strip()
+
+        # 2차: 저자 소개 페이지에서 추가 추출
+        if len(result) < len(target_names):
+            author_search_values = re.findall(
+                r"AuthorSearch=([^\"'&\s]+)", html, flags=re.IGNORECASE
+            )
+            author_search_values = list(dict.fromkeys(author_search_values))
+
+            for value in author_search_values:
+                author_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={value}"
+                try:
+                    req2 = urllib.request.Request(author_url, headers=headers)
+                    with urllib.request.urlopen(req2, timeout=12) as resp2:
+                        author_html = resp2.read().decode("utf-8", errors="ignore")
+
+                    pairs = re.findall(
+                        r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
+                        author_html
+                    )
+                    for kor_name, orig_name in pairs:
+                        kn = kor_name.strip()
+                        on = orig_name.strip()
+                        if kn in target_names and kn not in result:
+                            result[kn] = on
+                except Exception:
+                    continue
+
+    except Exception:
+        pass
+
+    return result
+
+
+def parse_authors(author_str, page_link=""):
+    """
+    알라딘 author 문자열 파싱 + 페이지 크롤링으로 원어명 보강.
     """
     result = []
-    found_names = set()
+    found = set()
 
-    # 케이스 1: 한국어이름 (영문원어명) (역할)
-    pattern1 = re.findall(
+    # 케이스 1: 한국어이름 (영문원어명) (역할) — API가 원어명을 직접 제공하는 경우
+    p1 = re.findall(
         r"([^,]+?)\s*\(([A-Za-z][^)]*)\)\s*\(([^)]+)\)",
         author_str
     )
-    for kor_name, original, role in pattern1:
+    for kor_name, original, role in p1:
         kor_name = kor_name.strip()
         if not is_korean(kor_name):
             continue
@@ -88,17 +144,13 @@ def parse_authors(author_str):
             "is_org": is_org(kor_name),
             "original_name": original.strip(),
         })
-        found_names.add(kor_name)
+        found.add(kor_name)
 
-    # 케이스 2: 이름 (역할) — 케이스 1에서 못 찾은 것
-    pattern2 = re.findall(r"([^,(]+?)\s*\(([^)]+)\)", author_str)
-    for name, info in pattern2:
+    # 케이스 2: 이름 (역할) — 일반 패턴
+    p2 = re.findall(r"([^,(]+?)\s*\(([^)]+)\)", author_str)
+    for name, info in p2:
         name = name.strip()
-        if not name:
-            continue
-        if is_western(name):
-            continue
-        if name in found_names:
+        if not name or is_western(name) or name in found:
             continue
         result.append({
             "name": name,
@@ -106,7 +158,7 @@ def parse_authors(author_str):
             "is_org": is_org(name),
             "original_name": "",
         })
-        found_names.add(name)
+        found.add(name)
 
     # 파싱 실패 시 기본 처리
     if not result:
@@ -116,13 +168,23 @@ def parse_authors(author_str):
                 result.append({
                     "name": name, "role": "", "is_org": is_org(name), "original_name": "",
                 })
+
+    # 원어명 없는 저자들에 대해 페이지 크롤링으로 보강
+    if page_link:
+        need_original = [
+            a["name"] for a in result
+            if not a["original_name"] and not a["is_org"] and is_korean(a["name"])
+        ]
+        if need_original:
+            scraped = extract_original_names_from_aladin_page(page_link, need_original)
+            for a in result:
+                if a["name"] in scraped:
+                    a["original_name"] = scraped[a["name"]]
+
     return result
 
 
 def build_245(title, subtitle, authors):
-    """
-    245 00 $a 본표제 $b : 부표제 /$d 역할: 이름 ;$e 역할: 이름
-    """
     a_part = title.strip()
     b_part = subtitle.strip() if subtitle else ""
 
@@ -163,7 +225,7 @@ def build_245(title, subtitle, authors):
 
 def build_700(author):
     """
-    원어명 있음  → 원어명 역순:       Mirtalipova, Dinara
+    원어명 있음  → 원어명 역순:            Nunez, Sigrid
     원어명 없음 + 한국어 2어절 이상 → 한국어 역순: 레빙턴, 리베카 가딘
     한국어 단일 이름               → 그대로:      김영아
     """
@@ -179,9 +241,7 @@ def build_700(author):
 
 
 def build_900(author):
-    """
-    원어명 있는 저자만 → 한국어 역순: 미르탈리포바, 디나라
-    """
+    """원어명 있는 저자만 → 한국어 역순"""
     name = author["name"].strip()
     original = author.get("original_name", "").strip()
     if original and is_western(original) and is_korean(name):
@@ -261,7 +321,10 @@ def isbn_lookup():
                 break
 
     author_str = item.get("author", "")
-    authors = parse_authors(author_str)
+    page_link = item.get("link", "")  # 알라딘 상품 페이지 URL
+
+    # 원어명 크롤링 포함 저자 파싱
+    authors = parse_authors(author_str, page_link)
 
     field_245 = build_245(title, subtitle, authors)
 
@@ -298,3 +361,4 @@ def isbn_lookup():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
