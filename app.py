@@ -75,11 +75,13 @@ def parse_authors(author_str):
 
     # 케이스 1: 한국어이름 (영문원어명) (역할)
     pattern1 = re.findall(
-        r"([\uac00-\ud7a3][\uac00-\ud7a3\s]+?)\s*\(([A-Za-z][^)]*)\)\s*\(([^)]+)\)",
+        r"([^,]+?)\s*\(([A-Za-z][^)]*)\)\s*\(([^)]+)\)",
         author_str
     )
     for kor_name, original, role in pattern1:
         kor_name = kor_name.strip()
+        if not is_korean(kor_name):
+            continue
         result.append({
             "name": kor_name,
             "role": role.strip(),
