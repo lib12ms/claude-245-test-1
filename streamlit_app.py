@@ -175,6 +175,11 @@ if "data" in st.session_state:
         st.markdown('<div class="marc-label">246 19 — 원제</div>', unsafe_allow_html=True)
         st.code(f246, language=None)
 
+    f500 = data["marc"].get("f500", "")
+    if f500:
+        st.markdown('<div class="marc-label">500 \\\\ — 원저자명 주기 (한자)</div>', unsafe_allow_html=True)
+        st.code(f500, language=None)
+
     f700_list = data["marc"].get("f700", [])
     if f700_list:
         st.markdown('<div class="marc-label">700 1_ — 개인명 부출기입</div>', unsafe_allow_html=True)
@@ -200,6 +205,8 @@ if "data" in st.session_state:
     all_fields = [f245_full]
     if f246:
         all_fields.append(f246)
+    if f500:
+        all_fields.append(f500)
     all_fields += f700_list + f710_list + f900_list + f940_list
 
     st.text_area(
