@@ -468,7 +468,7 @@ def is_east_asian_author_viaf(name):
 
 def extract_original_names_from_aladin_page(link, names):
     if not link or not names:
-        return {}
+        return {}, {}
 
     headers = {
         "User-Agent": (
