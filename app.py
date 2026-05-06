@@ -479,6 +479,7 @@ def extract_original_names_from_aladin_page(link, names):
     }
 
     result = {}
+    hanja_result = {}  # 한자 원저자명 별도 저장
     target_names = [n for n in names if not is_org(n)]
 
     try:
@@ -487,6 +488,7 @@ def extract_original_names_from_aladin_page(link, names):
             html = resp.read().decode("utf-8", errors="ignore")
 
         for name in target_names:
+            # 영문 원저자명 패턴
             pattern = re.compile(
                 rf"{re.escape(name)}\s*\(\s*([A-Za-z][A-Za-z .,'-]+)\s*\)",
                 re.IGNORECASE
@@ -494,6 +496,16 @@ def extract_original_names_from_aladin_page(link, names):
             match = pattern.search(html)
             if match:
                 result[name] = match.group(1).strip()
+
+            # 한자(일본어/중국어) 원저자명 패턴
+            # 예: 무라카미 하루키 (村上春樹), 안자이 미즈마루 (安西 水丸)
+            hanja_pattern = re.compile(
+                rf"{re.escape(name)}\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
+                re.IGNORECASE
+            )
+            hanja_match = hanja_pattern.search(html)
+            if hanja_match:
+                hanja_result[name] = hanja_match.group(1).strip()
 
         if len(result) < len(target_names):
             author_search_values = re.findall(
@@ -508,6 +520,7 @@ def extract_original_names_from_aladin_page(link, names):
                     with urllib.request.urlopen(req2, timeout=12) as resp2:
                         author_html = resp2.read().decode("utf-8", errors="ignore")
 
+                    # 영문 원저자명
                     pairs = re.findall(
                         r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
                         author_html
@@ -517,12 +530,24 @@ def extract_original_names_from_aladin_page(link, names):
                         on = orig_name.strip()
                         if kn in target_names and kn not in result:
                             result[kn] = on
+
+                    # 한자 원저자명
+                    hanja_pairs = re.findall(
+                        r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
+                        author_html
+                    )
+                    for kor_name, hanja_name in hanja_pairs:
+                        kn = kor_name.strip()
+                        hn = hanja_name.strip()
+                        if kn in target_names and kn not in hanja_result:
+                            hanja_result[kn] = hn
+
                 except Exception:
                     continue
     except Exception:
         pass
 
-    return result
+    return result, hanja_result
 
 
 # ─────────────────────────────────────────────
@@ -571,17 +596,24 @@ def parse_authors(author_str, page_link=""):
                     "name": name, "role": "", "is_org": is_org(name), "original_name": "",
                 })
 
-    # 페이지 크롤링으로 원어명 보강
+    # 페이지 크롤링으로 영문·한자 원저자명 보강
     if page_link:
         need_original = [
             a["name"] for a in result
             if not a["original_name"] and not a["is_org"] and is_korean(a["name"])
         ]
-        if need_original:
-            scraped = extract_original_names_from_aladin_page(page_link, need_original)
+        # 이미 원어명 있어도 한자는 추가로 크롤링
+        all_persons = [
+            a["name"] for a in result
+            if not a["is_org"] and is_korean(a["name"])
+        ]
+        if all_persons:
+            scraped, hanja_scraped = extract_original_names_from_aladin_page(page_link, all_persons)
             for a in result:
-                if a["name"] in scraped:
+                if a["name"] in scraped and not a["original_name"]:
                     a["original_name"] = scraped[a["name"]]
+                if a["name"] in hanja_scraped:
+                    a["hanja_name"] = hanja_scraped[a["name"]]
 
     return result
 
@@ -633,7 +665,25 @@ def build_245(title, subtitle, part_number, authors):
     return field
 
 
-def build_700(author):
+def build_500(authors):
+    """
+    500 \\ $a 원저자명 주기 생성.
+    한자(일본어/중국어) 원저자명이 있는 저자들을 쉼표로 나열.
+    예: 500 \\ $a 원저자명: 村上春樹, 安西 水丸
+    """
+    hanja_names = []
+    for a in authors:
+        hanja = a.get("hanja_name", "").strip()
+        if hanja:
+            hanja_names.append(hanja)
+
+    if not hanja_names:
+        return ""
+
+    return "500 \\\\ $a 원저자명: " + ", ".join(hanja_names)
+
+
+
     """
     원어명 있음  → 원어명 역순:                     Nunez, Sigrid
     원어명 없음 + 한국어 2어절 이상:
@@ -744,6 +794,9 @@ def isbn_lookup():
     # 246 원제 필드
     field_246 = build_246(item)
 
+    # 500 원저자명 주기 (한자 원저자명)
+    field_500 = build_500(authors)
+
     # 700 / 900 / 710 필드
     persons = [a for a in authors if not a["is_org"]]
     fields_700 = ["700 1_ " + build_700(a) for a in persons]
@@ -773,6 +826,7 @@ def isbn_lookup():
         "marc": {
             "f245": "245 00 " + field_245,
             "f246": field_246,
+            "f500": field_500,
             "f700": fields_700,
             "f710": fields_710,
             "f900": fields_900,
