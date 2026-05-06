@@ -715,6 +715,36 @@ def build_500(authors):
 
     return "$a " + name
 
+def build_700(author):
+    """
+    원어명 있음  → 원어명 역순:                     Nunez, Sigrid
+    원어명 없음 + 한국어 2어절 이상:
+      - VIAF로 동아시아인 확인 → 그대로:            무라카미 하루키
+      - VIAF로 비동아시아인 확인 → 역순:            레빙턴, 리베카 가딘
+    한국어 단일 이름 (2~5글자 공백없음) → 그대로:   김영아
+    """
+    name = author["name"].strip()
+    original = author.get("original_name", "").strip()
+
+    # 원어명 있으면 원어명 역순
+    if original and is_western(original):
+        return "$a " + invert_western(original)
+
+    # 한국어 단일 이름 (공백 없는 2~5글자) → 동아시아인, 그대로
+    if re.fullmatch(r"[가-힣]{2,5}", name):
+        return "$a " + name
+
+    # 한국어 2어절 이상 → VIAF로 동아시아인 여부 판별
+    if is_korean(name) and len(name.split()) >= 2:
+        east_asian = is_east_asian_author_viaf(name)
+        if east_asian:
+            return "$a " + name                 # 동아시아인 → 그대로
+        else:
+            return "$a " + invert_korean(name)  # 서양인 한국어 표기 → 역순
+
+    return "$a " + name
+
+
 def build_900(author):
     """원어명 있는 저자만 → 한국어 역순"""
     name = author["name"].strip()
