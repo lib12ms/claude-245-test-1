@@ -571,6 +571,7 @@ def parse_authors(author_str, page_link=""):
             "role": role.strip(),
             "is_org": is_org(kor_name),
             "original_name": original.strip(),
+            "hanja_name": "",
         })
         found.add(kor_name)
 
@@ -585,6 +586,7 @@ def parse_authors(author_str, page_link=""):
             "role": info.strip(),
             "is_org": is_org(name),
             "original_name": "",
+            "hanja_name": "",
         })
         found.add(name)
 
@@ -593,7 +595,8 @@ def parse_authors(author_str, page_link=""):
             name = name.strip()
             if name:
                 result.append({
-                    "name": name, "role": "", "is_org": is_org(name), "original_name": "",
+                    "name": name, "role": "", "is_org": is_org(name),
+                    "original_name": "", "hanja_name": "",
                 })
 
     # 페이지 크롤링으로 영문·한자 원저자명 보강
