@@ -637,21 +637,29 @@ def parse_authors(author_str, page_link=""):
         })
         found.add(kor_name)
 
-    # 케이스 2: 이름 (역할)
-    p2 = re.findall(r"([^,(]+?)\s*\(([^)]+)\)", author_str)
-    for name, info in p2:
-        name = name.strip()
-        if not name or is_western(name) or name in found:
+    # 케이스 2: 이름 (역할) — 단일 또는 쉼표 나열 후 마지막에 역할어
+    # 예1: 아쿠타가와 류노스케 (지은이)
+    # 예2: 나쓰메 소세키, 다자이 오사무, 아쿠타가와 류노스케 (지은이) → 모두 지은이
+    p2 = re.findall(r"([^(]+?)\s*\(([^)]+)\)", author_str)
+    for names_part, info in p2:
+        info = info.strip()
+        # 영문 원어명은 건너뜀 (케이스 1에서 처리)
+        if re.search(r"[A-Za-z]", info) and not is_korean(info):
             continue
-        result.append({
-            "name": name,
-            "role": info.strip(),
-            "is_org": is_org(name),
-            "original_name": "",
-            "hanja_name": "",
-            "nationality": None,
-        })
-        found.add(name)
+        # 쉼표로 나열된 이름들 분리
+        name_list = [n.strip() for n in names_part.split(",") if n.strip()]
+        for name in name_list:
+            if not name or is_western(name) or name in found:
+                continue
+            result.append({
+                "name": name,
+                "role": info,
+                "is_org": is_org(name),
+                "original_name": "",
+                "hanja_name": "",
+                "nationality": None,
+            })
+            found.add(name)
 
     if not result:
         for name in author_str.split(","):
