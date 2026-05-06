@@ -422,33 +422,36 @@ def is_east_asian_name_pattern(name):
     VIAF 조회 실패 시 패턴 기반 동아시아 이름 판별 폴백.
 
     규칙:
-    - 공백 없는 순수 한국어 2~5글자 → 동아시아 (김영아, 한강)
-    - 3어절 이상 한국어 → 서양인 표기 (리베카 가딘 레빙턴)
-    - 2어절 한국어, 한 어절 5글자 이상 → 서양인 표기 (디나라 미르탈리포바)
-    - 2어절 한국어, 총 7글자 이하 + 각 어절 4글자 이하 → 동아시아 (무라카미 하루키)
+    - 1어절 한국어 → 동아시아 (김영아, 한강, 위화)
+    - 2어절 한국어:
+        * 한 어절 6글자 이상 → 서양인 (미르탈리포바=6)
+        * 한 어절 5글자, 총 9글자 이하 → 동아시아 (아쿠타가와 류노스케=9)
+        * 한 어절 4글자 이하, 총 7글자 이하 → 동아시아 (무라카미 하루키=7)
+    - 3어절 이상 → 서양인 표기 (리베카 가딘 레빙턴)
     """
     name = name.strip()
     parts = name.split()
 
-    # 공백 없는 순수 한국어 2~5글자 → 한국인
-    if re.fullmatch(r"[가-힣]{2,5}", name):
-        return True
-
-    # 3어절 이상 한국어 → 서양인 표기
-    if len(parts) >= 3 and all(re.fullmatch(r"[가-힣]+", p) for p in parts):
+    if not all(re.fullmatch(r"[가-힣]+", p) for p in parts):
         return False
 
-    # 2어절 한국어
-    if len(parts) == 2 and all(re.fullmatch(r"[가-힣]+", p) for p in parts):
-        total = sum(len(p) for p in parts)
-        max_len = max(len(p) for p in parts)
-        # 한 어절이 5글자 이상 → 서양인 표기 (미르탈리포바=6)
-        if max_len >= 5:
-            return False
-        # 총 7글자 이하 + 각 어절 4글자 이하 → 동아시아인
-        if total <= 7 and max_len <= 4:
-            return True
+    # 1어절 → 항상 동아시아
+    if len(parts) == 1:
+        return True
 
+    max_len = max(len(p) for p in parts)
+    total = sum(len(p) for p in parts)
+
+    # 2어절
+    if len(parts) == 2:
+        if max_len >= 6:
+            return False  # 서양인 (미르탈리포바=6)
+        if max_len == 5 and total <= 9:
+            return True   # 일본인 성씨 (아쿠타가와 류노스케=9)
+        if max_len <= 4 and total <= 7:
+            return True   # 동아시아 (무라카미 하루키=7)
+
+    # 3어절 이상 → 서양인 표기
     return False
 
 
@@ -468,7 +471,7 @@ def is_east_asian_author_viaf(name):
 
 def extract_original_names_from_aladin_page(link, names):
     if not link or not names:
-        return {}, {}
+        return {}, {}, {}
 
     headers = {
         "User-Agent": (
@@ -479,8 +482,58 @@ def extract_original_names_from_aladin_page(link, names):
     }
 
     result = {}
-    hanja_result = {}  # 한자 원저자명 별도 저장
+    hanja_result = {}
+    # 동아시아 국적 여부: {이름: True/False/None}
+    nationality_result = {}
+
     target_names = [n for n in names if not is_org(n)]
+
+    # 동아시아 출생지/국적 키워드
+    EAST_ASIAN_ORIGINS = [
+        # 일본
+        "일본", "교토", "도쿄", "오사카", "삿포로", "후쿠오카", "나고야",
+        "요코하마", "고베", "히로시마", "일본 출생", "일본 출신",
+        # 중국
+        "중국", "베이징", "상하이", "광저우", "청두", "충칭",
+        "중국 출생", "중국 출신", "대만", "홍콩",
+        # 한국
+        "서울", "부산", "대구", "인천", "광주", "대전",
+        "한국 출생", "한국 출신",
+    ]
+
+    # 서양 출생지/국적 키워드
+    WESTERN_ORIGINS = [
+        "프랑스", "독일", "영국", "미국", "이탈리아", "스페인",
+        "러시아", "오스트리아", "스위스", "노르웨이", "스웨덴",
+        "덴마크", "네덜란드", "벨기에", "포르투갈", "그리스",
+        "뉴욕", "런던", "파리", "베를린", "모스크바",
+        "출생", "출신",  # 앞에 서양 도시가 있을 때
+    ]
+
+    def detect_nationality_from_text(text, name):
+        """저자 소개 텍스트에서 국적 판별"""
+        # 해당 저자 이름 주변 텍스트 추출 (300자)
+        idx = text.find(name)
+        if idx == -1:
+            return None
+        snippet = text[max(0, idx-50):idx+300]
+
+        for kw in EAST_ASIAN_ORIGINS:
+            if kw in snippet:
+                return "east_asian"
+
+        # 서양 출생지 패턴: "뉴욕 출생", "파리에서 태어" 등
+        western_city_pattern = re.search(
+            r"(프랑스|독일|영국|미국|이탈리아|스페인|러시아|오스트리아|"
+            r"스위스|노르웨이|스웨덴|덴마크|네덜란드|우즈베키스탄|카자흐스탄|"
+            r"뉴욕|런던|파리|베를린|모스크바|알제리|아르헨티나|브라질|"
+            r"콜롬비아|칠레|멕시코|쿠바|이란|이라크|이스라엘|인도|파키스탄)",
+            snippet
+        )
+        if western_city_pattern:
+            return "non_east_asian"
+
+        return None
 
     try:
         req = urllib.request.Request(link, headers=headers)
@@ -497,8 +550,7 @@ def extract_original_names_from_aladin_page(link, names):
             if match:
                 result[name] = match.group(1).strip()
 
-            # 한자(일본어/중국어) 원저자명 패턴
-            # 예: 무라카미 하루키 (村上春樹), 안자이 미즈마루 (安西 水丸)
+            # 한자 원저자명 패턴
             hanja_pattern = re.compile(
                 rf"{re.escape(name)}\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
                 re.IGNORECASE
@@ -507,47 +559,59 @@ def extract_original_names_from_aladin_page(link, names):
             if hanja_match:
                 hanja_result[name] = hanja_match.group(1).strip()
 
-        if len(result) < len(target_names):
-            author_search_values = re.findall(
-                r"AuthorSearch=([^\"'&\s]+)", html, flags=re.IGNORECASE
-            )
-            author_search_values = list(dict.fromkeys(author_search_values))
+            # 상품 페이지에서 국적 판별
+            nat = detect_nationality_from_text(html, name)
+            if nat:
+                nationality_result[name] = nat
 
-            for value in author_search_values:
-                author_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={value}"
-                try:
-                    req2 = urllib.request.Request(author_url, headers=headers)
-                    with urllib.request.urlopen(req2, timeout=12) as resp2:
-                        author_html = resp2.read().decode("utf-8", errors="ignore")
+        # 저자 소개 페이지 추가 크롤링
+        author_search_values = re.findall(
+            r"AuthorSearch=([^\"'&\s]+)", html, flags=re.IGNORECASE
+        )
+        author_search_values = list(dict.fromkeys(author_search_values))
 
-                    # 영문 원저자명
-                    pairs = re.findall(
-                        r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
-                        author_html
-                    )
-                    for kor_name, orig_name in pairs:
-                        kn = kor_name.strip()
-                        on = orig_name.strip()
-                        if kn in target_names and kn not in result:
-                            result[kn] = on
+        for value in author_search_values:
+            author_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={value}"
+            try:
+                req2 = urllib.request.Request(author_url, headers=headers)
+                with urllib.request.urlopen(req2, timeout=12) as resp2:
+                    author_html = resp2.read().decode("utf-8", errors="ignore")
 
-                    # 한자 원저자명
-                    hanja_pairs = re.findall(
-                        r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
-                        author_html
-                    )
-                    for kor_name, hanja_name in hanja_pairs:
-                        kn = kor_name.strip()
-                        hn = hanja_name.strip()
-                        if kn in target_names and kn not in hanja_result:
-                            hanja_result[kn] = hn
+                # 영문 원저자명
+                pairs = re.findall(
+                    r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
+                    author_html
+                )
+                for kor_name, orig_name in pairs:
+                    kn = kor_name.strip()
+                    on = orig_name.strip()
+                    if kn in target_names and kn not in result:
+                        result[kn] = on
 
-                except Exception:
-                    continue
+                # 한자 원저자명
+                hanja_pairs = re.findall(
+                    r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
+                    author_html
+                )
+                for kor_name, hanja_name in hanja_pairs:
+                    kn = kor_name.strip()
+                    hn = hanja_name.strip()
+                    if kn in target_names and kn not in hanja_result:
+                        hanja_result[kn] = hn
+
+                # 저자 소개 페이지에서 국적 판별
+                for name in target_names:
+                    if name not in nationality_result:
+                        nat = detect_nationality_from_text(author_html, name)
+                        if nat:
+                            nationality_result[name] = nat
+
+            except Exception:
+                continue
     except Exception:
         pass
 
-    return result, hanja_result
+    return result, hanja_result, nationality_result
 
 
 # ─────────────────────────────────────────────
@@ -572,6 +636,7 @@ def parse_authors(author_str, page_link=""):
             "is_org": is_org(kor_name),
             "original_name": original.strip(),
             "hanja_name": "",
+            "nationality": None,
         })
         found.add(kor_name)
 
@@ -587,6 +652,7 @@ def parse_authors(author_str, page_link=""):
             "is_org": is_org(name),
             "original_name": "",
             "hanja_name": "",
+            "nationality": None,
         })
         found.add(name)
 
@@ -596,27 +662,24 @@ def parse_authors(author_str, page_link=""):
             if name:
                 result.append({
                     "name": name, "role": "", "is_org": is_org(name),
-                    "original_name": "", "hanja_name": "",
+                    "original_name": "", "hanja_name": "", "nationality": None,
                 })
 
-    # 페이지 크롤링으로 영문·한자 원저자명 보강
+    # 페이지 크롤링으로 영문·한자 원저자명 + 국적 정보 보강
     if page_link:
-        need_original = [
-            a["name"] for a in result
-            if not a["original_name"] and not a["is_org"] and is_korean(a["name"])
-        ]
-        # 이미 원어명 있어도 한자는 추가로 크롤링
         all_persons = [
             a["name"] for a in result
             if not a["is_org"] and is_korean(a["name"])
         ]
         if all_persons:
-            scraped, hanja_scraped = extract_original_names_from_aladin_page(page_link, all_persons)
+            scraped, hanja_scraped, nat_scraped = extract_original_names_from_aladin_page(page_link, all_persons)
             for a in result:
                 if a["name"] in scraped and not a["original_name"]:
                     a["original_name"] = scraped[a["name"]]
                 if a["name"] in hanja_scraped:
                     a["hanja_name"] = hanja_scraped[a["name"]]
+                if a["name"] in nat_scraped:
+                    a["nationality"] = nat_scraped[a["name"]]
 
     return result
 
@@ -717,30 +780,46 @@ def build_500(authors):
 
 def build_700(author):
     """
-    원어명 있음  → 원어명 역순:                     Nunez, Sigrid
-    원어명 없음 + 한국어 2어절 이상:
-      - VIAF로 동아시아인 확인 → 그대로:            무라카미 하루키
-      - VIAF로 비동아시아인 확인 → 역순:            레빙턴, 리베카 가딘
-    한국어 단일 이름 (2~5글자 공백없음) → 그대로:   김영아
+    700 1_ 개인명 부출기입 도치 방식:
+
+    1. 영문 원어명 있음 → 원어명 역순:              Nunez, Sigrid
+    2. 한자 원저자명 있음 → 동아시아 확정 → 그대로: 무라카미 하루키
+    3. 알라딘 크롤링 국적 정보 있음 → 국적으로 판별
+    4. 한국어 단일 이름 (1어절) → 항상 그대로:      김영아
+    5. VIAF 조회 → 패턴 폴백
     """
     name = author["name"].strip()
     original = author.get("original_name", "").strip()
+    hanja = author.get("hanja_name", "").strip()
+    nationality = author.get("nationality")  # 'east_asian' / 'non_east_asian' / None
 
-    # 원어명 있으면 원어명 역순
+    # 1. 영문 원어명 → 원어명 역순
     if original and is_western(original):
         return "$a " + invert_western(original)
 
-    # 한국어 단일 이름 (공백 없는 2~5글자) → 동아시아인, 그대로
+    # 2. 한자 원저자명 → 동아시아 확정 → 그대로
+    if hanja:
+        return "$a " + name
+
+    # 3. 알라딘 크롤링 국적 정보 활용
+    if nationality == "east_asian":
+        return "$a " + name
+    if nationality == "non_east_asian":
+        if is_korean(name) and len(name.split()) >= 2:
+            return "$a " + invert_korean(name)
+        return "$a " + name
+
+    # 4. 한국어 단일 이름 → 그대로
     if re.fullmatch(r"[가-힣]{2,5}", name):
         return "$a " + name
 
-    # 한국어 2어절 이상 → VIAF로 동아시아인 여부 판별
+    # 5. 한국어 2어절 이상 → VIAF → 패턴 폴백
     if is_korean(name) and len(name.split()) >= 2:
         east_asian = is_east_asian_author_viaf(name)
         if east_asian:
-            return "$a " + name                 # 동아시아인 → 그대로
+            return "$a " + name
         else:
-            return "$a " + invert_korean(name)  # 서양인 한국어 표기 → 역순
+            return "$a " + invert_korean(name)
 
     return "$a " + name
 
