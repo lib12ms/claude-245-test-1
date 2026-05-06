@@ -5,7 +5,6 @@ import time
 
 API_BASE = st.secrets.get("API_BASE", "http://localhost:5000")
 
-# ── 상수 ────────────────────────────────────────
 ROLE_LABEL = {
     "옮긴이": "옮긴이", "역자": "옮긴이", "번역": "옮긴이",
     "그린이": "그린이", "그림": "그린이", "일러스트": "그린이",
@@ -15,32 +14,22 @@ ROLE_LABEL = {
 PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
 PRIMARY_LABEL = {"지은이": "지은이", "저자": "지은이", "글": "지은이", "글쓴이": "지은이", "": "지은이"}
 
-# ── 스타일 ──────────────────────────────────────
 st.set_page_config(page_title="KORMARC 자동 생성기", page_icon="📚", layout="centered")
 
 st.markdown("""
 <style>
 .marc-label {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #6c757d;
-    margin: 14px 0 4px 0;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #6c757d; margin: 14px 0 4px 0;
 }
-.server-status {
-    font-size: 13px;
-    padding: 8px 14px;
-    border-radius: 6px;
-    margin-bottom: 12px;
-}
-.status-ok { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-.status-wake { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-.status-err { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+.status-ok  { background:#d4edda; color:#155724; border:1px solid #c3e6cb; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
+.status-wake{ background:#fff3cd; color:#856404; border:1px solid #ffeeba; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── 서버 상태 확인 및 웨이크업 ──────────────────
+st.title("📚 KORMARC 자동 생성기")
+st.caption("알라딘 API 연동 · 245 / 246 / 700 / 710 / 900 / 940 필드 자동 생성")
+
 def check_server():
     try:
         resp = requests.get(API_BASE + "/health", timeout=5)
@@ -49,8 +38,7 @@ def check_server():
         return False
 
 def wakeup_server():
-    """Render 슬립 서버 깨우기 - 최대 60초 대기"""
-    for i in range(12):
+    for _ in range(12):
         try:
             resp = requests.get(API_BASE + "/health", timeout=8)
             if resp.status_code == 200:
@@ -60,25 +48,18 @@ def wakeup_server():
         time.sleep(5)
     return False
 
-# 앱 시작 시 서버 상태 확인 (캐시: 60초)
 @st.cache_data(ttl=60)
 def get_server_status():
     return check_server()
 
-# ── 헤더 ────────────────────────────────────────
-st.title("📚 KORMARC 자동 생성기")
-st.caption("알라딘 API 연동 · 245 / 700 / 710 / 900 필드 자동 생성")
-
-# ── 서버 상태 표시 ───────────────────────────────
 server_ok = get_server_status()
 if server_ok:
-    st.markdown('<div class="server-status status-ok">🟢 서버 연결됨 — 바로 조회할 수 있습니다.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="status-ok">🟢 서버 연결됨</div>', unsafe_allow_html=True)
 else:
-    st.markdown('<div class="server-status status-wake">🟡 서버가 슬립 상태입니다. 조회 시 자동으로 깨웁니다 (최대 30~60초 소요).</div>', unsafe_allow_html=True)
+    st.markdown('<div class="status-wake">🟡 서버 슬립 상태 — 조회 시 자동으로 깨웁니다 (최대 60초 소요)</div>', unsafe_allow_html=True)
 
 st.divider()
 
-# ── ISBN 입력 ────────────────────────────────────
 col1, col2 = st.columns([4, 1])
 with col1:
     isbn_input = st.text_input(
@@ -88,25 +69,21 @@ with col1:
 with col2:
     search = st.button("조회", use_container_width=True, type="primary")
 
-# ── API 호출 ─────────────────────────────────────
 def fetch_book(isbn_clean):
-    # 서버가 슬립 중이면 먼저 깨우기
     if not check_server():
-        with st.status("⏳ 서버를 깨우는 중입니다... (최대 60초 소요)", expanded=True) as status:
-            st.write("Render 무료 플랜은 15분 미사용 시 슬립 상태가 됩니다.")
+        with st.status("⏳ 서버를 깨우는 중...", expanded=True) as status:
             ok = wakeup_server()
             if ok:
-                status.update(label="✅ 서버가 준비됐습니다!", state="complete")
+                status.update(label="✅ 서버 준비 완료!", state="complete")
             else:
                 status.update(label="❌ 서버 연결 실패", state="error")
                 st.error("서버를 깨울 수 없습니다. 잠시 후 다시 시도해주세요.")
                 st.stop()
-
     try:
         resp = requests.get(
             API_BASE + "/api/isbn",
             params={"isbn": isbn_clean},
-            timeout=20,
+            timeout=30,
         )
         return resp
     except Exception as e:
@@ -125,14 +102,11 @@ if search and isbn_input:
     if not resp.ok:
         st.error(data.get("error", "오류가 발생했습니다."))
         st.stop()
-    # 서버 상태 캐시 갱신
     st.cache_data.clear()
     st.session_state["data"] = data
-
 elif search and not isbn_input:
     st.warning("ISBN을 입력해 주세요.")
 
-# ── 결과 표시 ────────────────────────────────────
 if "data" in st.session_state:
     data = st.session_state["data"]
 
@@ -151,13 +125,14 @@ if "data" in st.session_state:
     st.divider()
     st.info("✎ 표제·부제목을 수정하면 245 필드가 실시간 업데이트됩니다.")
 
-    col_t, col_s = st.columns(2)
+    col_t, col_s, col_n = st.columns([3, 3, 1])
     with col_t:
         edit_title = st.text_input("$a 본표제", value=data.get("title", ""), key="et")
     with col_s:
-        edit_subtitle = st.text_input("$b 부제목 (없으면 비워두세요)", value=data.get("subtitle", ""), key="es")
+        edit_subtitle = st.text_input("$b 부제목", value=data.get("subtitle", ""), key="es")
+    with col_n:
+        edit_part = st.text_input("$n 권차", value=data.get("part_number", ""), key="en")
 
-    # ── 245 재조립 ───────────────────────────────
     authors = data.get("authors", [])
     persons = [a for a in authors if not a.get("is_org")]
     primary = [a for a in persons if a.get("role", "") in PRIMARY_ROLES]
@@ -169,6 +144,8 @@ if "data" in st.session_state:
         role_groups.setdefault(lbl, []).append(a)
 
     f245 = "$a " + edit_title
+    if edit_part:
+        f245 += " $n " + edit_part
     if edit_subtitle:
         f245 += " $b : " + edit_subtitle
 
@@ -193,6 +170,11 @@ if "data" in st.session_state:
     st.markdown('<div class="marc-label">245 00 — 표제와 책임표시사항</div>', unsafe_allow_html=True)
     st.code(f245_full, language=None)
 
+    f246 = data["marc"].get("f246", "")
+    if f246:
+        st.markdown('<div class="marc-label">246 19 — 원제</div>', unsafe_allow_html=True)
+        st.code(f246, language=None)
+
     f700_list = data["marc"].get("f700", [])
     if f700_list:
         st.markdown('<div class="marc-label">700 1_ — 개인명 부출기입</div>', unsafe_allow_html=True)
@@ -208,24 +190,30 @@ if "data" in st.session_state:
         st.markdown('<div class="marc-label">900 10 — 한국어명 부출기입</div>', unsafe_allow_html=True)
         st.code("\n".join(f900_list), language=None)
 
+    f940_list = data["marc"].get("f940", [])
+    if f940_list:
+        st.markdown('<div class="marc-label">940 — 한국어 발음 표기</div>', unsafe_allow_html=True)
+        st.code("\n".join(f940_list), language=None)
+
     st.divider()
 
-    all_fields = [f245_full] + f700_list + f710_list + f900_list
+    all_fields = [f245_full]
+    if f246:
+        all_fields.append(f246)
+    all_fields += f700_list + f710_list + f900_list + f940_list
+
     st.text_area(
         "📋 전체 MARC 필드 (복사용)",
         value="\n".join(all_fields),
-        height=160,
+        height=180,
         help="Ctrl+A → Ctrl+C 로 전체 복사",
     )
 
     st.divider()
-    with st.expander("💡 서버 슬립 방지 방법 (UptimeRobot 무료)"):
-        st.markdown("""
+    with st.expander("💡 서버 슬립 방지 (UptimeRobot 무료)"):
+        st.markdown(f"""
 1. [uptimerobot.com](https://uptimerobot.com) 무료 가입
-2. **New Monitor** 클릭
-3. 아래처럼 설정:
-   - Monitor Type: `HTTP(s)`
-   - URL: `""" + API_BASE + """/health`
-   - Interval: `5 minutes`
-4. 저장하면 5분마다 자동으로 서버를 깨워서 슬립 방지!
+2. **New Monitor** → Monitor Type: `HTTP(s)`
+3. URL: `{API_BASE}/health` / Interval: `5 minutes`
+4. 저장하면 5분마다 자동 핑 → 슬립 방지!
         """)
