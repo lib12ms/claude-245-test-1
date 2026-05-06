@@ -331,6 +331,16 @@ def get_viaf_nationality(name):
     반환: 'east_asian' / 'non_east_asian' / None(조회 실패)
     동아시아(한국/일본/중국 등) 저자는 이름 도치 불필요.
     """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/javascript, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+        "Referer": "https://viaf.org/",
+    }
     try:
         search_url = "https://viaf.org/viaf/search"
         params = {
@@ -339,7 +349,9 @@ def get_viaf_nationality(name):
             "startRecord": 1,
             "httpAccept": "application/json",
         }
-        resp = requests.get(search_url, params=params, timeout=8)
+        resp = requests.get(search_url, params=params, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
         data = resp.json()
         records = (
             data.get("searchRetrieveResponse", {})
@@ -379,42 +391,79 @@ def get_viaf_nationality(name):
         viaf_id = viaf_cluster.get("viafID") or viaf_cluster.get("@viafID")
         if viaf_id:
             detail_url = f"https://viaf.org/viaf/{viaf_id}/viaf.json"
-            resp2 = requests.get(detail_url, timeout=8)
-            detail = resp2.json()
-            src_list = detail.get("sources", {}).get("s", [])
-            if isinstance(src_list, str):
-                src_list = [src_list]
-            for src in src_list:
-                src_id = src.get("@id", "") if isinstance(src, dict) else str(src)
-                for es in EAST_ASIAN_SOURCES:
-                    if es in src_id:
-                        return "east_asian"
-            nat2 = detail.get("nationalityOfAssociatedName", {})
-            if isinstance(nat2, dict):
-                nd = nat2.get("data", [])
-                if isinstance(nd, dict):
-                    nd = [nd]
-                for item in nd:
-                    text = (item.get("text", "") or "").lower()
-                    if text in EAST_ASIAN_NATIONALITIES:
-                        return "east_asian"
+            resp2 = requests.get(detail_url, headers=headers, timeout=10)
+            if resp2.status_code == 200:
+                detail = resp2.json()
+                src_list = detail.get("sources", {}).get("s", [])
+                if isinstance(src_list, str):
+                    src_list = [src_list]
+                for src in src_list:
+                    src_id = src.get("@id", "") if isinstance(src, dict) else str(src)
+                    for es in EAST_ASIAN_SOURCES:
+                        if es in src_id:
+                            return "east_asian"
+                nat2 = detail.get("nationalityOfAssociatedName", {})
+                if isinstance(nat2, dict):
+                    nd = nat2.get("data", [])
+                    if isinstance(nd, dict):
+                        nd = [nd]
+                    for item in nd:
+                        text = (item.get("text", "") or "").lower()
+                        if text in EAST_ASIAN_NATIONALITIES:
+                            return "east_asian"
 
         return "non_east_asian"
     except Exception:
         return None
 
 
+def is_east_asian_name_pattern(name):
+    """
+    VIAF 조회 실패 시 패턴 기반 동아시아 이름 판별 폴백.
+
+    규칙:
+    - 공백 없는 순수 한국어 2~5글자 → 동아시아 (김영아, 한강)
+    - 3어절 이상 한국어 → 서양인 표기 (리베카 가딘 레빙턴)
+    - 2어절 한국어, 한 어절 5글자 이상 → 서양인 표기 (디나라 미르탈리포바)
+    - 2어절 한국어, 총 7글자 이하 + 각 어절 4글자 이하 → 동아시아 (무라카미 하루키)
+    """
+    name = name.strip()
+    parts = name.split()
+
+    # 공백 없는 순수 한국어 2~5글자 → 한국인
+    if re.fullmatch(r"[가-힣]{2,5}", name):
+        return True
+
+    # 3어절 이상 한국어 → 서양인 표기
+    if len(parts) >= 3 and all(re.fullmatch(r"[가-힣]+", p) for p in parts):
+        return False
+
+    # 2어절 한국어
+    if len(parts) == 2 and all(re.fullmatch(r"[가-힣]+", p) for p in parts):
+        total = sum(len(p) for p in parts)
+        max_len = max(len(p) for p in parts)
+        # 한 어절이 5글자 이상 → 서양인 표기 (미르탈리포바=6)
+        if max_len >= 5:
+            return False
+        # 총 7글자 이하 + 각 어절 4글자 이하 → 동아시아인
+        if total <= 7 and max_len <= 4:
+            return True
+
+    return False
+
+
 def is_east_asian_author_viaf(name):
-    """VIAF 기반 동아시아 저자 여부 판별. 실패 시 이름 패턴으로 폴백."""
+    """
+    VIAF 기반 동아시아 저자 여부 판별.
+    VIAF 조회 실패 시 이름 패턴으로 폴백.
+    """
     result = get_viaf_nationality(name)
     if result == "east_asian":
         return True
     if result == "non_east_asian":
         return False
-    # 폴백: 공백 없는 2~5글자 한국어 → 동아시아인
-    if re.fullmatch(r"[가-힣]{2,5}", name.strip()):
-        return True
-    return False
+    # VIAF 조회 실패 → 패턴 기반 폴백
+    return is_east_asian_name_pattern(name)
 
 
 def extract_original_names_from_aladin_page(link, names):
