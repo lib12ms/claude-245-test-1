@@ -303,27 +303,35 @@ def build_940(title_a):
 # ─────────────────────────────────────────────
 # VIAF 저자 국적 조회
 # ─────────────────────────────────────────────
-# VIAF에서 한국어 관련 nationality 코드
-KOREAN_NATIONALITIES = {
-    "ko",           # 한국어
-    "kor",          # 한국어 ISO 639-2
+# VIAF에서 동아시아 관련 nationality 코드 (역순 변환 안 하는 국가들)
+EAST_ASIAN_NATIONALITIES = {
+    # 한국
+    "ko", "kor",
+    # 일본
+    "ja", "jpn", "jp",
+    # 중국
+    "zh", "chi", "zho", "cn",
+    # 대만
+    "tw",
+    # 베트남
+    "vi", "vie", "vn",
 }
 
-# VIAF 소스 중 한국국립중앙도서관 코드
-KOREAN_SOURCES = {"NLSK", "NLK"}
+# VIAF 소스 중 동아시아 국립도서관 코드
+EAST_ASIAN_SOURCES = {
+    "NLSK", "NLK",        # 한국국립중앙도서관
+    "NDL",                # 일본국립국회도서관
+    "NLC",                # 중국국가도서관
+    "PLWABN",             # 폴란드 (제외용 아님, 동아시아만)
+}
 
 def get_viaf_nationality(name):
     """
     VIAF API로 저자 국적/언어 정보 조회.
-    반환: 'korean' / 'non_korean' / None(조회 실패)
-
-    VIAF 판별 방식:
-    1. 한국국립중앙도서관(NLK/NLSK) 소스에 등록된 저자 → 한국인
-    2. nationalityOfAssociatedName 필드에 ko/kor → 한국인
-    3. 그 외 → 외국인
+    반환: 'east_asian' / 'non_east_asian' / None(조회 실패)
+    동아시아(한국/일본/중국 등) 저자는 이름 도치 불필요.
     """
     try:
-        # 1단계: VIAF에서 저자 검색
         search_url = "https://viaf.org/viaf/search"
         params = {
             "query": f'local.personalNames all "{name}"',
@@ -333,33 +341,28 @@ def get_viaf_nationality(name):
         }
         resp = requests.get(search_url, params=params, timeout=8)
         data = resp.json()
-
         records = (
             data.get("searchRetrieveResponse", {})
                 .get("records", {})
                 .get("record", [])
         )
-
-        # 단일 레코드면 리스트로 변환
         if isinstance(records, dict):
             records = [records]
-
         if not records:
             return None
 
-        # 2단계: 첫 번째 결과로 판별
         record_data = records[0].get("recordData", {})
         viaf_cluster = record_data.get("VIAFCluster", record_data)
 
-        # 방법 1: 소스 기관 확인 — NLK(국립중앙도서관) 소스면 한국인
+        # 방법 1: 동아시아 국립도서관 소스 확인 (NLK=한국, NDL=일본, NLC=중국)
         sources = viaf_cluster.get("sources", {}).get("s", [])
         if isinstance(sources, str):
             sources = [sources]
         for source in sources:
             source_id = source.get("@id", "") if isinstance(source, dict) else str(source)
-            for ks in KOREAN_SOURCES:
-                if ks in source_id:
-                    return "korean"
+            for es in EAST_ASIAN_SOURCES:
+                if es in source_id:
+                    return "east_asian"
 
         # 방법 2: nationalityOfAssociatedName 필드 확인
         nat_field = viaf_cluster.get("nationalityOfAssociatedName", {})
@@ -369,27 +372,23 @@ def get_viaf_nationality(name):
                 nat_data = [nat_data]
             for item in nat_data:
                 text = (item.get("text", "") or "").lower()
-                if text in KOREAN_NATIONALITIES:
-                    return "korean"
+                if text in EAST_ASIAN_NATIONALITIES:
+                    return "east_asian"
 
-        # 방법 3: VIAF ID로 상세 정보 조회
+        # 방법 3: VIAF ID 상세 조회
         viaf_id = viaf_cluster.get("viafID") or viaf_cluster.get("@viafID")
         if viaf_id:
             detail_url = f"https://viaf.org/viaf/{viaf_id}/viaf.json"
             resp2 = requests.get(detail_url, timeout=8)
             detail = resp2.json()
-
-            # 소스 기관 재확인
             src_list = detail.get("sources", {}).get("s", [])
             if isinstance(src_list, str):
                 src_list = [src_list]
             for src in src_list:
                 src_id = src.get("@id", "") if isinstance(src, dict) else str(src)
-                for ks in KOREAN_SOURCES:
-                    if ks in src_id:
-                        return "korean"
-
-            # 국적 코드 재확인
+                for es in EAST_ASIAN_SOURCES:
+                    if es in src_id:
+                        return "east_asian"
             nat2 = detail.get("nationalityOfAssociatedName", {})
             if isinstance(nat2, dict):
                 nd = nat2.get("data", [])
@@ -397,39 +396,27 @@ def get_viaf_nationality(name):
                     nd = [nd]
                 for item in nd:
                     text = (item.get("text", "") or "").lower()
-                    if text in KOREAN_NATIONALITIES:
-                        return "korean"
+                    if text in EAST_ASIAN_NATIONALITIES:
+                        return "east_asian"
 
-        return "non_korean"
-
+        return "non_east_asian"
     except Exception:
         return None
 
 
-def is_korean_author_viaf(name):
-    """
-    VIAF 기반 한국인 저자 여부 판별.
-    조회 실패 시 이름 패턴으로 폴백:
-      - 공백 없는 2~5글자 한국어 → 한국인으로 간주
-    """
+def is_east_asian_author_viaf(name):
+    """VIAF 기반 동아시아 저자 여부 판별. 실패 시 이름 패턴으로 폴백."""
     result = get_viaf_nationality(name)
-
-    if result == "korean":
+    if result == "east_asian":
         return True
-    if result == "non_korean":
+    if result == "non_east_asian":
         return False
-
-    # VIAF 조회 실패 시 이름 패턴으로 폴백
-    # 공백 없는 순수 한국어 2~5글자 → 한국인 (김영아, 한강, 박찬욱 등)
+    # 폴백: 공백 없는 2~5글자 한국어 → 동아시아인
     if re.fullmatch(r"[가-힣]{2,5}", name.strip()):
         return True
-
     return False
 
 
-# ─────────────────────────────────────────────
-# 알라딘 페이지 크롤링 (원어명 추출)
-# ─────────────────────────────────────────────
 def extract_original_names_from_aladin_page(link, names):
     if not link or not names:
         return {}
@@ -599,12 +586,11 @@ def build_245(title, subtitle, part_number, authors):
 
 def build_700(author):
     """
-    원어명 있음  → 원어명 역순:                  Nunez, Sigrid
+    원어명 있음  → 원어명 역순:                     Nunez, Sigrid
     원어명 없음 + 한국어 2어절 이상:
-      - VIAF로 한국인 확인 → 그대로:             (해당 없음 — 한국인은 보통 단일 이름)
-      - VIAF로 외국인 확인 → 역순:               레빙턴, 리베카 가딘
-      - VIAF 조회 실패 → 이름 패턴으로 폴백
-    한국어 단일 이름 (2~5글자 공백없음) → 그대로: 김영아
+      - VIAF로 동아시아인 확인 → 그대로:            무라카미 하루키
+      - VIAF로 비동아시아인 확인 → 역순:            레빙턴, 리베카 가딘
+    한국어 단일 이름 (2~5글자 공백없음) → 그대로:   김영아
     """
     name = author["name"].strip()
     original = author.get("original_name", "").strip()
@@ -613,20 +599,19 @@ def build_700(author):
     if original and is_western(original):
         return "$a " + invert_western(original)
 
-    # 한국어 단일 이름 (공백 없는 2~5글자) → 한국인, 그대로
+    # 한국어 단일 이름 (공백 없는 2~5글자) → 동아시아인, 그대로
     if re.fullmatch(r"[가-힣]{2,5}", name):
         return "$a " + name
 
-    # 한국어 2어절 이상 → VIAF로 한국인 여부 판별
+    # 한국어 2어절 이상 → VIAF로 동아시아인 여부 판별
     if is_korean(name) and len(name.split()) >= 2:
-        korean = is_korean_author_viaf(name)
-        if korean:
-            return "$a " + name       # 한국인 → 그대로
+        east_asian = is_east_asian_author_viaf(name)
+        if east_asian:
+            return "$a " + name                 # 동아시아인 → 그대로
         else:
-            return "$a " + invert_korean(name)  # 외국인 한국어 표기 → 역순
+            return "$a " + invert_korean(name)  # 서양인 한국어 표기 → 역순
 
     return "$a " + name
-
 
 def build_900(author):
     """원어명 있는 저자만 → 한국어 역순"""
