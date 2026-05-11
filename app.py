@@ -1,3 +1,10 @@
+try:
+    import hanja
+    HANJA_AVAILABLE = True
+except ImportError:
+    HANJA_AVAILABLE = False
+
+
 """
 KORMARC 자동 생성기 - Flask 백엔드 (Render 배포용)
 
