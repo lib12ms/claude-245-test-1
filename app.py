@@ -1,10 +1,3 @@
-try:
-    import hanja
-    HANJA_AVAILABLE = True
-except ImportError:
-    HANJA_AVAILABLE = False
-
-
 """
 KORMARC 자동 생성기 - Flask 백엔드 (Render 배포용)
 
@@ -30,11 +23,56 @@ from bs4 import BeautifulSoup
 import re
 import os
 
-try:
-    import hanja
-    HANJA_AVAILABLE = True
-except ImportError:
-    HANJA_AVAILABLE = False
+# 한자 → 한국 음독 딕셔너리 (라이브러리 없이 직접 구현)
+HANJA_READING: dict[str, str] = {
+    "村":"촌","上":"상","春":"춘","樹":"수",
+    "安":"안","西":"서","水":"수","丸":"환",
+    "阿":"아","部":"부","曉":"효","子":"자",
+    "村":"촌","山":"산","川":"천","田":"전",
+    "中":"중","大":"대","小":"소","木":"목",
+    "本":"본","森":"삼","林":"림","原":"원",
+    "野":"야","井":"정","石":"석","金":"금",
+    "藤":"등","松":"송","竹":"죽","梅":"매",
+    "花":"화","鳥":"조","魚":"어","馬":"마",
+    "龍":"룡","鳳":"봉","虎":"호","鶴":"학",
+    "一":"일","二":"이","三":"삼","四":"사",
+    "五":"오","六":"육","七":"칠","八":"팔",
+    "九":"구","十":"십","百":"백","千":"천",
+    "萬":"만","億":"억","東":"동","西":"서",
+    "南":"남","北":"북","左":"좌","右":"우",
+    "前":"전","後":"후","内":"내","外":"외",
+    "天":"천","地":"지","人":"인","火":"화",
+    "月":"월","日":"일","年":"년","生":"생",
+    "死":"사","愛":"애","心":"심","道":"도",
+    "太":"태","正":"정","新":"신","古":"고",
+    "長":"장","短":"단","高":"고","低":"저",
+    "明":"명","暗":"암","光":"광","影":"영",
+    "白":"백","黑":"흑","赤":"적","靑":"청",
+    "黄":"황","紫":"자","緑":"록","橙":"등",
+    "美":"미","善":"선","眞":"진","幸":"행",
+    "福":"복","祿":"록","壽":"수","喜":"희",
+    "怒":"노","哀":"애","樂":"락","平":"평",
+    "和":"화","戰":"전","友":"우","敵":"적",
+    "王":"왕","臣":"신","民":"민","官":"관",
+    "文":"문","武":"무","詩":"시","歌":"가",
+    "書":"서","画":"화","音":"음","楽":"악",
+    "海":"해","空":"공","陸":"육","星":"성",
+    "雨":"우","雪":"설","風":"풍","雲":"운",
+    "花":"화","草":"초","木":"목","葉":"엽",
+    "実":"실","根":"근","枝":"지","幹":"간",
+}
+
+def kanji_to_korean_reading(name: str) -> str | None:
+    """한자 이름을 한국 음독으로 변환. 예: 村上春樹 → 촌상춘수"""
+    result = []
+    for ch in name:
+        if ch in HANJA_READING:
+            result.append(HANJA_READING[ch])
+        elif re.match(r"[\u4e00-\u9fff\u3400-\u4dbf]", ch):
+            # 딕셔너리에 없는 한자는 변환 불가
+            return None
+        # 히라가나/가타카나 등은 건너뜀
+    return "".join(result) if result else None
 
 app = Flask(__name__)
 CORS(app)
@@ -256,29 +294,27 @@ ALADIN_HEADERS = {
     )
 }
 
-def scrape_aladin_product(item_id: str, primary_author_name: str) -> dict:
+def scrape_aladin_product(item_id: str) -> dict:
     """
-    알라딘 상품 페이지를 크롤링해서 원제, 원저자 영문명, 한자명, 동아시아 여부를 추출합니다.
+    알라딘 상품 페이지를 크롤링합니다.
 
-    1. 원제/원저자 영문명: "원제" 링크의 SearchWord 파라미터에서 추출
-       - ALL CAPS 단어 → 원저자명
-       - 나머지 단어  → 원서명
-
-    2. 한자명 + 동아시아 여부: 저자 소개 텍스트에서 직접 추출
-       - "아베 아키코(阿部曉子)" 패턴 → 한자명
-       - 국적/출생지 키워드 → 동아시아 여부
+    1. 원제/원저자 영문명: "원제" 링크의 SearchWord에서 추출
+    2. 한자명 맵: meta-author 태그에서 "한글명, 漢字名" 패턴으로 모든 저자 한자명 추출
+       예: meta-author = "아베 아키코, 阿部曉子"
+           → {"아베 아키코": "阿部曉子"}
+    3. 동아시아 여부: 페이지 텍스트 키워드로 판별
 
     반환: {
         "orig_title": str|None,
         "orig_author_en": str|None,
-        "kanji_name": str|None,
+        "kanji_map": dict,   # {"한글명": "漢字名"}
         "is_east_asian": bool
     }
     """
     result = {
-        "orig_title": None,
+        "orig_title":    None,
         "orig_author_en": None,
-        "kanji_name": None,
+        "kanji_map":     {},
         "is_east_asian": False,
     }
 
@@ -307,22 +343,37 @@ def scrape_aladin_product(item_id: str, primary_author_name: str) -> dict:
             if author_parts:
                 result["orig_author_en"] = " ".join(to_title_case(p) for p in author_parts)
 
-    # ── 2. 한자명 + 동아시아 여부 ───────────────────
-    # 상품 페이지 텍스트에서 "저자명(漢字名)" 패턴 탐색
-    # 예: "아베 아키코(阿部曉子)" 또는 "아베 아키코 (阿部曉子)"
-    if primary_author_name:
-        # 저자명 바로 뒤 괄호 안의 CJK 문자 추출
-        escaped = re.escape(primary_author_name)
-        kanji_match = re.search(
-            escaped + r"\s*\(([^\)]{2,8})\)",
-            page_text
-        )
-        if kanji_match:
-            candidate = kanji_match.group(1).strip()
-            if re.fullmatch(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff]+", candidate):
-                result["kanji_name"] = candidate
+    # ── 2. 한자명 맵 — meta-author 태그에서 추출 ────
+    # 예: <meta name="author" content="아베 아키코, 阿部曉子">
+    # 또는 <meta property="og:author" content="아베 아키코, 阿部曉子, 이소담">
+    CJK_PATTERN = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff]")
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "") or meta.get("value", "")
+        if not content:
+            continue
+        # author 관련 메타태그만
+        name_attr = (meta.get("name", "") + meta.get("property", "")).lower()
+        if "author" not in name_attr:
+            continue
 
-    # 동아시아 저자 판별: 페이지 텍스트에서 키워드 감지
+        # "아베 아키코, 阿部曉子, 이소담" 형태를 쉼표로 분리
+        parts = [p.strip() for p in content.split(",")]
+        # 한글명과 그 바로 다음 한자명을 짝 지음
+        i = 0
+        while i < len(parts):
+            ko_name = parts[i]
+            # 한글이 포함된 이름
+            if re.search(r"[\uac00-\ud7a3]", ko_name) and not CJK_PATTERN.search(ko_name):
+                # 다음 항목이 한자/가나로만 구성된 이름이면 짝으로 처리
+                if i + 1 < len(parts):
+                    next_part = parts[i + 1]
+                    if CJK_PATTERN.search(next_part) and not re.search(r"[\uac00-\ud7a3]", next_part):
+                        result["kanji_map"][ko_name] = next_part
+                        i += 2
+                        continue
+            i += 1
+
+    # ── 3. 동아시아 저자 판별 ────────────────────────
     if any(kw in page_text for kw in EAST_ASIA_KEYWORDS):
         result["is_east_asian"] = True
 
@@ -394,15 +445,15 @@ def collect_orig_info(item: dict, item_id: str, title: str, authors: list[dict])
     }
     """
     # 번역자 제외 저자 목록 (지은이, 그린이 등)
-    non_trans = [a for a in authors if not a["is_org"] and a["role"] not in TRANS_ROLES]
-    primary_ko = [a for a in non_trans if a["role"] in PRIMARY_ROLES]
+    non_trans    = [a for a in authors if not a["is_org"] and a["role"] not in TRANS_ROLES]
+    primary_ko   = [a for a in non_trans if a["role"] in PRIMARY_ROLES]
     primary_name = primary_ko[0]["name"] if primary_ko else (non_trans[0]["name"] if non_trans else "")
 
-    # 알라딘 상품 페이지 1회 크롤링 (원제 + 첫 번째 저자 한자명)
-    scraped = scrape_aladin_product(item_id, primary_name)
-
+    # 알라딘 상품 페이지 1회 크롤링 (원제 + kanji_map + 동아시아 여부)
+    scraped        = scrape_aladin_product(item_id)
     orig_title     = scraped["orig_title"]
     orig_author_en = scraped["orig_author_en"]
+    kanji_map      = scraped["kanji_map"]   # {"한글명": "漢字名"}
     is_east_asian  = scraped["is_east_asian"]
 
     # 알라딘 API subInfo.originalTitle 우선
@@ -420,38 +471,15 @@ def collect_orig_info(item: dict, item_id: str, title: str, authors: list[dict])
     if not orig_author_en and orig_title:
         orig_author_en = gbooks_search_by_orig_title(orig_title)
 
-    # ── 각 저자별 한자명 수집 ───────────────────────
-    # 상품 페이지를 한 번만 가져와서 모든 저자 한자명을 한꺼번에 추출
+    # ── 각 저자별 한자명 — kanji_map에서 바로 조회 ──
     author_info = []
-    try:
-        url  = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
-        resp = requests.get(url, headers=ALADIN_HEADERS, timeout=10)
-        resp.raise_for_status()
-        page_text = BeautifulSoup(resp.text, "html.parser").get_text()
-    except requests.RequestException:
-        page_text = ""
-
     for a in non_trans:
-        name = a["name"]
-        kanji = None
-
-        if page_text:
-            # "저자명(漢字名)" 또는 "저자명 (漢字名)" 패턴
-            escaped = re.escape(name)
-            m = re.search(escaped + r"\s*\(([^\)]{2,10})\)", page_text)
-            if m:
-                candidate = m.group(1).strip()
-                # 한자/가나만 포함된 경우 채택
-                if re.fullmatch(
-                    r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\s]+",
-                    candidate
-                ):
-                    kanji = candidate.strip()
-
+        name  = a["name"]
+        kanji = kanji_map.get(name)  # meta-author 태그에서 추출한 한자명
         author_info.append({
             "name":          name,
             "kanji_name":    kanji,
-            "is_east_asian": is_east_asian,  # 페이지 전체에서 판별한 값 공유
+            "is_east_asian": is_east_asian,
         })
 
     return {
