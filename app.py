@@ -62,6 +62,21 @@ ROLE_LABEL = {
 PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
 TRANS_ROLES   = {"옮긴이", "역자", "번역", "편역"}
 
+# 동아시아 저자 판별 키워드 (국적·출생지)
+EAST_ASIA_KEYWORDS = (
+    # 국적
+    "일본", "중국", "대만", "홍콩",
+    # 출생지 관련
+    "출생", "고향", "태어", "출신",
+    # 일본 지명
+    "도쿄", "오사카", "교토", "이와테", "홋카이도", "오키나와",
+    "나고야", "후쿠오카", "삿포로", "고베", "요코하마",
+    # 중국 지명
+    "베이징", "상하이", "광저우", "타이베이",
+    # 한자 지명
+    "東京", "大阪", "京都", "北京", "上海",
+)
+
 
 # ─────────────────────────────────────────────
 # 공통 유틸
@@ -176,16 +191,17 @@ def scrape_author_intro(item_id: str, author_name: str) -> dict:
     """
     알라딘 저자 소개 페이지에서 한자명과 동아시아 저자 여부를 판별합니다.
 
-    - 저자 소개에 출생·고향·태어 등 키워드가 있으면 동아시아 저자로 간주
-      → 900 10 성명 도치 안 함
-    - 한자(CJK) 이름이 있으면 추출해서 반환
-      → 500 필드에 한자명 추가
+    판별 방법:
+    - 상품 페이지에서 AuthorSearch=@숫자 형태의 저자 링크 추출
+    - 저자 소개 페이지에서 국적(일본/중국 등) 또는 출생지 키워드 감지
+      → 동아시아 저자면 900 도치 안 함
+    - 저자명 옆 괄호 안 한자 패턴으로 한자명 추출
+      예: "아베 아키코(阿部曉子)" → "阿部曉子"
 
     반환: {"is_east_asian": bool, "kanji_name": str|None}
     """
     result = {"is_east_asian": False, "kanji_name": None}
 
-    # 알라딘 저자 소개는 저자 ID가 필요하므로 상품 페이지에서 저자 링크 추출
     url     = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
     headers = {
         "User-Agent": (
@@ -203,41 +219,51 @@ def scrape_author_intro(item_id: str, author_name: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 저자명으로 저자 링크 찾기
-    author_link = None
+    # 상품 페이지에서 AuthorSearch=@숫자 형태의 저자 링크 추출
+    author_id = None
     for a_tag in soup.find_all("a", href=re.compile(r"AuthorSearch=")):
         if author_name in a_tag.get_text():
-            author_link = a_tag.get("href", "")
-            break
+            href = a_tag.get("href", "")
+            m = re.search(r"AuthorSearch=([^&\"]+)", href)
+            if m:
+                author_id = m.group(1)  # 예: "%ec%95%84%eb%b2%a0...@1609632" 또는 "@1609632"
+                break
 
-    if not author_link:
+    if not author_id:
         return result
-
-    # 저자 ID 추출
-    auth_match = re.search(r"AuthorSearch=([^@&]+)@(\d+)", author_link)
-    if not auth_match:
-        return result
-
-    author_id = auth_match.group(2)
 
     # 저자 소개 페이지 요청
-    intro_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorId={author_id}"
+    intro_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={author_id}"
     try:
         resp2 = requests.get(intro_url, headers=headers, timeout=10)
         resp2.raise_for_status()
-        intro_text = BeautifulSoup(resp2.text, "html.parser").get_text()
+        intro_soup = BeautifulSoup(resp2.text, "html.parser")
+        intro_text = intro_soup.get_text()
     except requests.RequestException:
         return result
 
-    # 동아시아 저자 키워드 감지
+    # ── 동아시아 저자 판별 ──────────────────────────
+    # 국적 필드 또는 출생지 키워드로 판별
     if any(kw in intro_text for kw in EAST_ASIA_KEYWORDS):
         result["is_east_asian"] = True
 
-    # 한자명 추출: CJK 문자 2~6자 연속 패턴
-    # 저자 소개 첫 부분에서 한자 이름 찾기
-    kanji_matches = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]{2,6}", intro_text[:500])
-    if kanji_matches:
-        result["kanji_name"] = kanji_matches[0]
+    # ── 한자명 추출 ─────────────────────────────────
+    # 패턴 1: "저자명(漢字名)" 형태 — 저자 소개 상단에 주로 등장
+    kanji_match = re.search(
+        r"[\uac00-\ud7a3\s]+\(([^\)]{2,8})\)",
+        intro_text[:300]
+    )
+    if kanji_match:
+        candidate = kanji_match.group(1).strip()
+        # CJK 문자만 포함된 경우만 채택
+        if re.fullmatch(r"[\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef]+", candidate):
+            result["kanji_name"] = candidate
+
+    # 패턴 2: 못 찾으면 CJK 2~6자 연속 패턴으로 폴백
+    if not result["kanji_name"]:
+        kanji_matches = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]{2,6}", intro_text[:400])
+        if kanji_matches:
+            result["kanji_name"] = kanji_matches[0]
 
     return result
 
