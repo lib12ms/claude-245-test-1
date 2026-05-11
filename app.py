@@ -372,44 +372,85 @@ def gbooks_search_by_orig_title(orig_title: str) -> str | None:
 # ─────────────────────────────────────────────
 def collect_orig_info(item: dict, item_id: str, title: str, authors: list[dict]) -> dict:
     """
+    번역서의 원제와 모든 외국 저자(지은이, 그린이 등)의 한자명/동아시아 여부를 수집합니다.
+
     반환: {
-        "orig_title": str|None,
-        "orig_author_en": str|None,
-        "kanji_name": str|None,
-        "is_east_asian": bool
+        "orig_title":    str|None,
+        "orig_author_en": str|None,          # 서양 저자일 때만
+        "author_info": [                      # 번역자 제외 모든 저자
+            {
+                "name": "무라카미 하루키",    # 한글명 (알라딘)
+                "kanji_name": "村上春樹",     # 한자명 (크롤링)
+                "is_east_asian": True,
+            }, ...
+        ]
     }
     """
-    primary_ko = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
-    primary_name = primary_ko[0]["name"] if primary_ko else ""
+    # 번역자 제외 저자 목록 (지은이, 그린이 등)
+    non_trans = [a for a in authors if not a["is_org"] and a["role"] not in TRANS_ROLES]
+    primary_ko = [a for a in non_trans if a["role"] in PRIMARY_ROLES]
+    primary_name = primary_ko[0]["name"] if primary_ko else (non_trans[0]["name"] if non_trans else "")
 
-    # 알라딘 상품 페이지 크롤링 (원제 + 원저자영문 + 한자명 + 동아시아 여부 한번에)
+    # 알라딘 상품 페이지 1회 크롤링 (원제 + 첫 번째 저자 한자명)
     scraped = scrape_aladin_product(item_id, primary_name)
 
     orig_title     = scraped["orig_title"]
     orig_author_en = scraped["orig_author_en"]
-    kanji_name     = scraped["kanji_name"]
     is_east_asian  = scraped["is_east_asian"]
 
-    # 알라딘 API subInfo.originalTitle 우선 적용
+    # 알라딘 API subInfo.originalTitle 우선
     sub_info = item.get("subInfo", {})
     if isinstance(sub_info, dict):
         api_orig = sub_info.get("originalTitle", "").strip()
         if api_orig:
             orig_title = remove_year(api_orig)
 
-    # 원제 없으면 Google Books로 폴백
+    # 원제 없으면 Google Books 폴백
     if not orig_title:
         orig_title = gbooks_search_by_korean(title, primary_name)
 
-    # 원저자 영문명 없으면 원제로 Google Books 재검색
+    # 원저자 영문명 없으면 Google Books 폴백
     if not orig_author_en and orig_title:
         orig_author_en = gbooks_search_by_orig_title(orig_title)
+
+    # ── 각 저자별 한자명 수집 ───────────────────────
+    # 상품 페이지를 한 번만 가져와서 모든 저자 한자명을 한꺼번에 추출
+    author_info = []
+    try:
+        url  = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
+        resp = requests.get(url, headers=ALADIN_HEADERS, timeout=10)
+        resp.raise_for_status()
+        page_text = BeautifulSoup(resp.text, "html.parser").get_text()
+    except requests.RequestException:
+        page_text = ""
+
+    for a in non_trans:
+        name = a["name"]
+        kanji = None
+
+        if page_text:
+            # "저자명(漢字名)" 또는 "저자명 (漢字名)" 패턴
+            escaped = re.escape(name)
+            m = re.search(escaped + r"\s*\(([^\)]{2,10})\)", page_text)
+            if m:
+                candidate = m.group(1).strip()
+                # 한자/가나만 포함된 경우 채택
+                if re.fullmatch(
+                    r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\s]+",
+                    candidate
+                ):
+                    kanji = candidate.strip()
+
+        author_info.append({
+            "name":          name,
+            "kanji_name":    kanji,
+            "is_east_asian": is_east_asian,  # 페이지 전체에서 판별한 값 공유
+        })
 
     return {
         "orig_title":     orig_title,
         "orig_author_en": orig_author_en,
-        "kanji_name":     kanji_name,
-        "is_east_asian":  is_east_asian,
+        "author_info":    author_info,
     }
 
 
@@ -606,38 +647,59 @@ def isbn_lookup():
     # ── 원제 · 원저자 수집 ──────────────────────────
     orig_title:     str | None = None
     orig_author_en: str | None = None
-    orig_author_ko: str | None = None
-    is_east_asian:  bool       = False
-    kanji_name:     str | None = None
+    author_info:    list       = []
 
     if has_translator:
         orig_info      = collect_orig_info(item, item_id, title, authors)
         orig_title     = orig_info["orig_title"]
         orig_author_en = orig_info["orig_author_en"]
-        kanji_name     = orig_info["kanji_name"]
-        is_east_asian  = orig_info["is_east_asian"]
-
-        primary_ko = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
-        if primary_ko:
-            orig_author_ko = primary_ko[0]["name"]
+        author_info    = orig_info["author_info"]
 
     # ── MARC 필드 생성 ──────────────────────────────
     field_245 = build_245(title, subtitle, authors)
     field_246 = build_246(orig_title)
-    field_500 = build_500(orig_author_en, kanji_name)
 
+    # 500: 원저자명 — 모든 외국 저자의 한자명/영문명을 쉼표로 합침
+    # 예: "500 __ $a 원저자명: 村上春樹, 安西水丸"
+    orig_names_500 = []
+    for ai in author_info:
+        kanji = ai["kanji_name"]
+        if kanji:
+            orig_names_500.append(kanji)
+        elif not ai["is_east_asian"] and orig_author_en:
+            orig_names_500.append(orig_author_en)
+    # 서양 저자이면서 한자명 없는 경우 (author_info 없을 때)
+    if not orig_names_500 and orig_author_en:
+        orig_names_500.append(orig_author_en)
+    field_500 = f"500 __ $a 원저자명: {', '.join(orig_names_500)}" if orig_names_500 else None
+
+    # 700: 번역자 포함 모든 저자
     persons    = [a for a in authors if not a["is_org"]]
     fields_700 = []
-    orig_700   = build_700_orig(orig_author_en, kanji_name)
-    if orig_700:
-        fields_700.append(orig_700)
+
+    # 서양 원저자면 영문명 역순 부출
+    first_ai = author_info[0] if author_info else None
+    if first_ai and not first_ai["kanji_name"] and not first_ai["is_east_asian"] and orig_author_en:
+        orig_700 = build_700_orig(orig_author_en, None)
+        if orig_700:
+            fields_700.append(orig_700)
+
+    # 나머지 모든 저자 (한글명)
     fields_700 += [f"700 1_ {build_700(a)}" for a in persons]
 
     orgs       = [a for a in authors if a["is_org"]]
     fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
 
-    field_900  = build_900(orig_author_ko, is_east_asian, kanji_name)
-    fields_900 = [field_900] if field_900 else []
+    # 900: 외국 저자별 처리
+    fields_900 = []
+    for ai in author_info:
+        kanji         = ai["kanji_name"]
+        is_east_asian = ai["is_east_asian"]
+        ko_name       = ai["name"]
+
+        f900 = build_900(ko_name, is_east_asian, kanji)
+        if f900:
+            fields_900.append(f900)
 
     return jsonify({
         "isbn13":     isbn13,
@@ -667,3 +729,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+  
