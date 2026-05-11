@@ -2,7 +2,7 @@
 KORMARC 자동 생성기 - Flask 백엔드 (Render 배포용)
 
 알라딘 API를 이용해 ISBN으로 도서 정보를 조회하고
-KORMARC 245, 246, 500, 700, 710 필드를 자동 생성합니다.
+KORMARC 245, 246, 500, 700, 710, 900 필드를 자동 생성합니다.
 
 [원제·원저자 수집 전략]
 
@@ -16,16 +16,12 @@ KORMARC 245, 246, 500, 700, 710 필드를 자동 생성합니다.
      2순위: ①에서 찾은 원제로 Google Books 재검색 → volumeInfo.authors
 
 [생성 필드]
-  245 00  표제와 책임표시사항
-  246 19  원서명 (번역서만)
-  500 __  원저자명 주기 (번역서만)
-  700 1_  개인명 부출기입
+  245 00  표제와 책임표시사항 (총서명 제거)
+  246 19  원서명 (번역서만, 연도 제거)
+  500 __  원저자명 주기 (번역서만, 이름 정순)
+  700 1_  개인명 부출기입 (원저자 영문명 역순)
   710 0_  기관명 부출기입
-
-[245 구성 규칙]
-  /$d 첫번째저자
-  ,$e 두번째저자 (공동저자, 반복)
-  ;$e 역자·그린이 등 역할어 다른 저자
+  900 10  원저자 한글명 역순 부출기입 (번역서만)
 """
 
 from flask import Flask, request, jsonify
@@ -41,7 +37,7 @@ CORS(app)
 ALADIN_API_KEY = os.environ.get("ALADIN_API_KEY", "ttbboyeong09010919001")
 ALADIN_API_URL = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
 GBOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
-GBOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")  # 없어도 하루 1000건 무료
+GBOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
 
 # ─────────────────────────────────────────────
 # 상수
@@ -77,6 +73,50 @@ def is_org(name: str) -> bool:
 def to_title_case(word: str) -> str:
     """SAINT-EXUPERY → Saint-Exupery"""
     return "-".join(part.capitalize() for part in word.split("-"))
+
+
+def remove_series(title: str) -> str:
+    """
+    제목에서 총서명(괄호로 묶인 부분) 제거
+    예: "젊은 베르테르의 슬픔 (먼슬리 클래식)" → "젊은 베르테르의 슬픔"
+    """
+    return re.sub(r"\s*\([^)]+\)\s*$", "", title).strip()
+
+
+def remove_year(text: str) -> str:
+    """
+    텍스트에서 연도 괄호 제거
+    예: "Die Leiden des Jungen Werther (1774년)" → "Die Leiden des Jungen Werther"
+    """
+    return re.sub(r"\s*\(\d{4}년?\)\s*$", "", text).strip()
+
+
+def korean_name_reverse(name: str) -> str | None:
+    """
+    한글 이름을 역순으로 변환합니다.
+    성이 앞에 오는 한국식과 이름이 앞에 오는 서양식 한글 표기 모두 처리.
+    예: "요한 볼프강 폰 괴테" → "괴테, 요한 볼프강 폰"
+        (마지막 단어를 성으로 간주)
+    한글이 없으면 None 반환.
+    """
+    if not re.search(r"[\uac00-\ud7a3]", name):
+        return None
+    parts = name.strip().split()
+    if len(parts) < 2:
+        return None
+    # 마지막 단어를 성으로 간주
+    return f"{parts[-1]}, {' '.join(parts[:-1])}"
+
+
+def english_name_reverse(name: str) -> str:
+    """
+    영문 이름을 역순으로 변환합니다.
+    예: "Johann Wolfgang von Goethe" → "Goethe, Johann Wolfgang von"
+    """
+    parts = name.strip().split()
+    if len(parts) < 2:
+        return name
+    return f"{parts[-1]}, {' '.join(parts[:-1])}"
 
 
 def parse_authors(author_str: str) -> list[dict]:
@@ -128,9 +168,6 @@ def fetch_aladin(isbn: str) -> dict:
 def scrape_aladin_page(item_id: str) -> dict:
     """
     알라딘 상품 페이지의 '원제' 링크에서 원서명·원저자 영문명을 추출합니다.
-    링크 형태: SearchTarget=Foreign&SearchWord=Le+Petit+Prince+ANTOINE+DE+SAINT-EXUPERY
-      - ALL CAPS 단어 → 원저자명
-      - 그 외 단어    → 원서명
     반환: {"orig_title": str|None, "orig_author_en": str|None}
     """
     result = {"orig_title": None, "orig_author_en": None}
@@ -166,7 +203,7 @@ def scrape_aladin_page(item_id: str) -> dict:
             title_parts  = [p for p in parts if p not in author_parts]
 
             if title_parts:
-                result["orig_title"] = " ".join(title_parts)
+                result["orig_title"] = remove_year(" ".join(title_parts))
             if author_parts:
                 result["orig_author_en"] = " ".join(to_title_case(p) for p in author_parts)
 
@@ -177,10 +214,7 @@ def scrape_aladin_page(item_id: str) -> dict:
 # Google Books — 1차: 한글 제목+저자로 원제 탐색
 # ─────────────────────────────────────────────
 def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
-    """
-    한글 제목 + 저자명으로 Google Books를 검색해 원서명을 찾습니다.
-    영문/외국어 제목이 반환되면 원제로 채택합니다.
-    """
+    """한글 제목 + 저자명으로 Google Books를 검색해 원서명을 찾습니다."""
     query  = f"{title} {primary_author_name}"
     params: dict = {"q": query, "maxResults": 5, "langRestrict": "ko"}
     if GBOOKS_API_KEY:
@@ -197,10 +231,11 @@ def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
         info    = item.get("volumeInfo", {})
         g_title = info.get("title", "").strip()
 
-        # 한글이 포함되지 않은 제목 → 원서명으로 채택
+        # 한글이 없는 제목 → 원서명으로 채택
         if g_title and not re.search(r"[\uac00-\ud7a3]", g_title):
             sub = info.get("subtitle", "").strip()
-            return f"{g_title} : {sub}" if sub else g_title
+            raw = f"{g_title} : {sub}" if sub else g_title
+            return remove_year(raw)
 
     return None
 
@@ -209,9 +244,7 @@ def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
 # Google Books — 2차: 원제로 원저자 영문명 탐색
 # ─────────────────────────────────────────────
 def gbooks_search_by_orig_title(orig_title: str) -> str | None:
-    """
-    원제로 Google Books를 검색해 원저자 영문명을 찾습니다.
-    """
+    """원제로 Google Books를 검색해 원저자 영문명을 찾습니다."""
     params: dict = {"q": f'intitle:"{orig_title}"', "maxResults": 3}
     if GBOOKS_API_KEY:
         params["key"] = GBOOKS_API_KEY
@@ -237,54 +270,42 @@ def gbooks_search_by_orig_title(orig_title: str) -> str | None:
 def collect_orig_info(
     item: dict,
     item_id: str,
-    isbn13: str,
     title: str,
     authors: list[dict],
 ) -> dict:
     """
-    번역서에 대해 원제·원저자 영문명을 수집합니다.
-
-    ① 원제 찾기
-       1순위: 알라딘 API subInfo.originalTitle
-       2순위: 알라딘 상품 페이지 크롤링
-       3순위: Google Books — 한글 제목+저자명으로 검색
-
-    ② 원저자 영문명 찾기
-       1순위: 알라딘 상품 페이지 크롤링
-       2순위: Google Books — ①에서 찾은 원제로 재검색
-
+    ① 원제: 알라딘 API → 알라딘 크롤링 → Google Books(한글 검색)
+    ② 원저자 영문명: 알라딘 크롤링 → Google Books(원제 검색)
     반환: {"orig_title": str|None, "orig_author_en": str|None}
     """
     orig_title:     str | None = None
     orig_author_en: str | None = None
 
-    # ── ① 원제 찾기 ─────────────────────────────
-
+    # ── ① 원제 ──────────────────────────────────
     # 1순위: 알라딘 API subInfo.originalTitle
     sub_info = item.get("subInfo", {})
     if isinstance(sub_info, dict):
         api_orig = sub_info.get("originalTitle", "").strip()
         if api_orig:
-            orig_title = api_orig
+            orig_title = remove_year(api_orig)
 
     # 2순위: 알라딘 상품 페이지 크롤링
     scraped = scrape_aladin_page(item_id)
     if not orig_title and scraped["orig_title"]:
         orig_title = scraped["orig_title"]
 
-    # 크롤링에서 원저자 영문명도 같이 얻었으면 저장
+    # 크롤링에서 원저자 영문명도 얻었으면 저장
     if scraped["orig_author_en"]:
         orig_author_en = scraped["orig_author_en"]
 
     # 3순위: Google Books — 한글 제목+저자명으로 원제 탐색
     if not orig_title:
-        primary = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
+        primary     = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
         author_name = primary[0]["name"] if primary else ""
-        orig_title = gbooks_search_by_korean(title, author_name)
+        orig_title  = gbooks_search_by_korean(title, author_name)
 
-    # ── ② 원저자 영문명 찾기 ────────────────────
-
-    # 2순위: ①에서 찾은 원제로 Google Books 재검색
+    # ── ② 원저자 영문명 ─────────────────────────
+    # 2순위: 원제로 Google Books 재검색
     if not orig_author_en and orig_title:
         orig_author_en = gbooks_search_by_orig_title(orig_title)
 
@@ -295,7 +316,8 @@ def collect_orig_info(
 # MARC 필드 빌더
 # ─────────────────────────────────────────────
 def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
-    a_part    = title.strip()
+    # 총서명(괄호) 제거
+    a_part    = remove_series(title)
     b_part    = subtitle.strip() if subtitle else ""
     persons   = [a for a in authors if not a["is_org"]]
     primary   = [a for a in persons if a["role"] in PRIMARY_ROLES]
@@ -317,45 +339,61 @@ def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
         for label, names in role_groups.items():
             for name in names:
                 field += f" ;$e {name}"
-        field += "."
     elif role_groups:
         all_names = [n for ns in role_groups.values() for n in ns]
         field += f" /$d {all_names[0]}"
         for name in all_names[1:]:
             field += f" ,$e {name}"
-        field += "."
-    else:
-        field += "."
 
     return field
 
 
 def build_246(orig_title: str | None) -> str | None:
-    """246 19 — 원서명 (번역서 + 원제 있을 때만)"""
+    """246 19 — 원서명 (연도 제거)"""
     if not orig_title:
         return None
-    return f"246 19 $a {orig_title.strip()}."
+    return f"246 19 $a {remove_year(orig_title.strip())}"
 
 
 def build_500(orig_author_en: str | None) -> str | None:
-    """500 __ — 원저자명 주기 (번역서 + 영문명 있을 때만)"""
+    """500 __ — 원저자명 주기 (이름 정순, 구두점 없음)"""
     if not orig_author_en:
         return None
-    return f"500 __ $a 원저자명: {orig_author_en.strip()}."
+    return f"500 __ $a 원저자명: {orig_author_en.strip()}"
 
 
 def build_700(author: dict) -> str:
+    """700 1_ — 개인명 부출 (이름 뒤 구두점 없음)"""
     name = author["name"].strip()
-    # 영문 이름이면 성, 이름 역순 변환
+    # 영문 이름이면 역순 변환
     if re.search(r"[A-Za-z]", name) and not re.search(r"[\uac00-\ud7a3]", name):
-        parts = name.split()
-        if len(parts) >= 2:
-            name = f"{parts[-1]}, {' '.join(parts[:-1])}"
-    return f"$a {name},"
+        name = english_name_reverse(name)
+    return f"$a {name}"
+
+
+def build_700_orig(orig_author_en: str) -> str | None:
+    """700 1_ — 원저자 영문명 역순 부출 (이름 뒤 구두점 없음)"""
+    if not orig_author_en:
+        return None
+    return f"700 1_ $a {english_name_reverse(orig_author_en)}"
 
 
 def build_710(author: dict) -> str:
-    return f"$a {author['name'].strip()}."
+    """710 0_ — 기관명 부출 (이름 뒤 구두점 없음)"""
+    return f"$a {author['name'].strip()}"
+
+
+def build_900(orig_author_ko: str | None) -> str | None:
+    """
+    900 10 — 원저자 한글명 역순 부출 (번역서만)
+    예: "요한 볼프강 폰 괴테" → "900 10 $a 괴테, 요한 볼프강 폰"
+    """
+    if not orig_author_ko:
+        return None
+    reversed_name = korean_name_reverse(orig_author_ko)
+    if not reversed_name:
+        return None
+    return f"900 10 $a {reversed_name}"
 
 
 # ─────────────────────────────────────────────
@@ -403,25 +441,39 @@ def isbn_lookup():
     item_id        = str(item.get("itemId", ""))
     has_translator = any(a["role"] in TRANS_ROLES for a in authors)
 
-    # ── 원제 · 원저자 영문명 수집 ───────────────────
+    # ── 원제 · 원저자 수집 ──────────────────────────
     orig_title:     str | None = None
     orig_author_en: str | None = None
+    orig_author_ko: str | None = None  # 알라딘 저자명(한글) 중 1저자
 
     if has_translator:
-        orig_info      = collect_orig_info(item, item_id, isbn13, title, authors)
+        orig_info      = collect_orig_info(item, item_id, title, authors)
         orig_title     = orig_info["orig_title"]
         orig_author_en = orig_info["orig_author_en"]
+
+        # 원저자 한글명: 알라딘 authors 중 PRIMARY 역할 첫 번째
+        primary_ko = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
+        if primary_ko:
+            orig_author_ko = primary_ko[0]["name"]
 
     # ── MARC 필드 생성 ──────────────────────────────
     field_245 = build_245(title, subtitle, authors)
     field_246 = build_246(orig_title)
     field_500 = build_500(orig_author_en)
 
+    # 700: 원저자 영문 역순 부출 + 나머지 저자들
     persons    = [a for a in authors if not a["is_org"]]
-    fields_700 = [f"700 1_ {build_700(a)}" for a in persons]
+    fields_700 = []
+    if orig_author_en:
+        fields_700.append(build_700_orig(orig_author_en))
+    fields_700 += [f"700 1_ {build_700(a)}" for a in persons]
 
     orgs       = [a for a in authors if a["is_org"]]
     fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
+
+    # 900: 원저자 한글명 역순 부출
+    field_900 = build_900(orig_author_ko)
+    fields_900 = [field_900] if field_900 else []
 
     return jsonify({
         "isbn13":     isbn13,
@@ -434,10 +486,11 @@ def isbn_lookup():
         "cover":      item.get("cover", ""),
         "marc": {
             "f245": f"245 00 {field_245}",
-            "f246": field_246,   # 번역서 + 원제 있을 때만, 없으면 null
-            "f500": field_500,   # 번역서 + 원저자 영문명 있을 때만, 없으면 null
+            "f246": field_246,
+            "f500": field_500,
             "f700": fields_700,
             "f710": fields_710,
+            "f900": fields_900,
         }
     })
 
