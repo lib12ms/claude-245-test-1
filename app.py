@@ -23,6 +23,12 @@ from bs4 import BeautifulSoup
 import re
 import os
 
+try:
+    import hanja
+    HANJA_AVAILABLE = True
+except ImportError:
+    HANJA_AVAILABLE = False
+
 app = Flask(__name__)
 CORS(app)
 
@@ -137,6 +143,47 @@ def korean_name_reverse(name: str) -> str | None:
     if len(parts) < 2:
         return None
     return f"{parts[-1]}, {' '.join(parts[:-1])}"
+
+
+def kanji_type(name: str) -> str:
+    """
+    한자명의 문자 구성을 판별합니다.
+    - "kanji_only"  : 한자만 (예: 村上春樹)  → 900 필드에 한국 음독 표기
+    - "kanji_kana"  : 한자+히라가나/가타카나 혼합 (예: 鈴木いづみ) → 900 필드 생략
+    - "kana_only"   : 가나만 (히라가나/가타카나)
+    - "other"       : 그 외 (알파벳 등)
+    """
+    has_kanji    = bool(re.search(r"[\u4e00-\u9fff\u3400-\u4dbf]", name))
+    has_hiragana = bool(re.search(r"[\u3040-\u309f]", name))
+    has_katakana = bool(re.search(r"[\u30a0-\u30ff]", name))
+    has_kana     = has_hiragana or has_katakana
+
+    if has_kanji and has_kana:
+        return "kanji_kana"
+    elif has_kanji:
+        return "kanji_only"
+    elif has_kana:
+        return "kana_only"
+    else:
+        return "other"
+
+
+def kanji_to_korean_reading(name: str) -> str | None:
+    """
+    한자 이름을 한국 음독으로 변환합니다.
+    예: 村上春樹 → 촌상춘수
+    hanja 라이브러리 사용, 없으면 None 반환.
+    """
+    if not HANJA_AVAILABLE:
+        return None
+    try:
+        result = hanja.translate(name, "substitution")
+        # 변환 결과에 한글이 있으면 성공
+        if re.search(r"[\uac00-\ud7a3]", result):
+            return result
+    except Exception:
+        pass
+    return None
 
 
 def english_name_reverse(name: str) -> str:
@@ -409,47 +456,106 @@ def build_246(orig_title: str | None) -> str | None:
 
 def build_500(orig_author_en: str | None, kanji_name: str | None = None) -> str | None:
     """
-    500 __ $a 원저자명: Akiko Abe (阿部曉子)
-    한자명만 있을 때: 500 __ $a 원저자명: 阿部曉子
+    500 __ $a 원저자명 주기
+
+    케이스 1: 한자+가나 혼합 (鈴木いづみ)
+      → 500 __ $a 원저자명: 鈴木いづみ
+
+    케이스 2: 한자만 (村上春樹)
+      → 500 __ $a 원저자명: 村上春樹
+
+    케이스 3: 서양 저자 (Georges Bernanos)
+      → 500 __ $a 원저자명: Georges Bernanos
+
+    케이스 4: 서양 저자 + 한자명 (阿部曉子)
+      → 500 __ $a 원저자명: Akiko Abe (阿部曉子)
     """
-    if not orig_author_en and not kanji_name:
-        return None
-    base = orig_author_en.strip() if orig_author_en else ""
     if kanji_name:
-        base = f"{base} ({kanji_name})" if base else kanji_name
-    return f"500 __ $a 원저자명: {base}"
+        ktype = kanji_type(kanji_name)
+        if ktype in ("kanji_only", "kanji_kana"):
+            # 동아시아 저자: 한자명만 표기 (영문명 제외)
+            return f"500 __ $a 원저자명: {kanji_name}"
+    if orig_author_en:
+        return f"500 __ $a 원저자명: {orig_author_en.strip()}"
+    return None
+
+
+def build_700_orig(orig_author_en: str | None, kanji_name: str | None = None) -> str | None:
+    """
+    700 1_ 원저자 부출
+
+    케이스 1: 한자+가나 혼합 → 한글명(알라딘 저자명) 그대로
+    케이스 2: 한자만 → 한글명(알라딘 저자명) 그대로
+    케이스 3: 서양 저자 → 영문명 역순
+    """
+    if kanji_name:
+        ktype = kanji_type(kanji_name)
+        if ktype in ("kanji_only", "kanji_kana"):
+            # 동아시아 저자는 700에 영문명 부출 안 함 (한글명은 700에서 처리)
+            return None
+    if orig_author_en:
+        return f"700 1_ $a {english_name_reverse(orig_author_en)}"
+    return None
+
+
+def build_900(
+    orig_author_ko: str | None,
+    is_east_asian: bool = False,
+    kanji_name: str | None = None,
+) -> str | None:
+    """
+    900 10 원저자 한글명 부출
+
+    케이스 1: 한자+가나 혼합 (鈴木いづみ)
+      → 900 생략 (None)
+
+    케이스 2: 한자만 (村上春樹)
+      → 900 10 $a 촌상춘수 (hanja 음독 변환)
+      → 변환 실패 시 None
+
+    케이스 3: 서양 저자 (요한 볼프강 폰 괴테)
+      → 900 10 $a 괴테, 요한 볼프강 폰 (역순)
+
+    케이스 4: 동아시아 저자지만 한자명 없음 (아베 아키코)
+      → 900 10 $a 아베 아키코 (도치 안 함)
+    """
+    if kanji_name:
+        ktype = kanji_type(kanji_name)
+        if ktype == "kanji_kana":
+            # 한자+가나 혼합 → 900 생략
+            return None
+        if ktype == "kanji_only":
+            # 한자만 → 한국 음독 변환
+            reading = kanji_to_korean_reading(kanji_name)
+            if reading:
+                return f"900 10 $a {reading}"
+            return None
+
+    if not orig_author_ko:
+        return None
+
+    if is_east_asian:
+        # 동아시아 저자 (한자명 없는 경우) → 도치 안 함
+        return f"900 10 $a {orig_author_ko.strip()}"
+
+    # 서양 저자 → 역순
+    reversed_name = korean_name_reverse(orig_author_ko)
+    if not reversed_name:
+        return None
+    return f"900 10 $a {reversed_name}"
 
 
 def build_700(author: dict) -> str:
+    """700 1_ — 개인명 부출 (영문이면 역순 변환)"""
     name = author["name"].strip()
     if re.search(r"[A-Za-z]", name) and not re.search(r"[\uac00-\ud7a3]", name):
         name = english_name_reverse(name)
     return f"$a {name}"
 
 
-def build_700_orig(orig_author_en: str) -> str | None:
-    if not orig_author_en:
-        return None
-    return f"700 1_ $a {english_name_reverse(orig_author_en)}"
-
-
 def build_710(author: dict) -> str:
+    """710 0_ — 기관명 부출"""
     return f"$a {author['name'].strip()}"
-
-
-def build_900(orig_author_ko: str | None, is_east_asian: bool = False) -> str | None:
-    """
-    동아시아 저자: 도치 안 함  "아베 아키코" → "900 10 $a 아베 아키코"
-    서양 저자:    도치 함      "요한 볼프강 폰 괴테" → "900 10 $a 괴테, 요한 볼프강 폰"
-    """
-    if not orig_author_ko:
-        return None
-    if is_east_asian:
-        return f"900 10 $a {orig_author_ko.strip()}"
-    reversed_name = korean_name_reverse(orig_author_ko)
-    if not reversed_name:
-        return None
-    return f"900 10 $a {reversed_name}"
 
 
 # ─────────────────────────────────────────────
@@ -522,14 +628,15 @@ def isbn_lookup():
 
     persons    = [a for a in authors if not a["is_org"]]
     fields_700 = []
-    if orig_author_en:
-        fields_700.append(build_700_orig(orig_author_en))
+    orig_700   = build_700_orig(orig_author_en, kanji_name)
+    if orig_700:
+        fields_700.append(orig_700)
     fields_700 += [f"700 1_ {build_700(a)}" for a in persons]
 
     orgs       = [a for a in authors if a["is_org"]]
     fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
 
-    field_900  = build_900(orig_author_ko, is_east_asian)
+    field_900  = build_900(orig_author_ko, is_east_asian, kanji_name)
     fields_900 = [field_900] if field_900 else []
 
     return jsonify({
