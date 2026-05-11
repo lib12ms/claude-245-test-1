@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: kormarc-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python /opt/render/project/src/app.py
+    envVars:
+      - key: ALADIN_API_KEY
+        sync: false
