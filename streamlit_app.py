@@ -1,18 +1,8 @@
 import streamlit as st
 import requests
-import re
 import time
 
 API_BASE = st.secrets.get("API_BASE", "http://localhost:5000")
-
-ROLE_LABEL = {
-    "옮긴이": "옮긴이", "역자": "옮긴이", "번역": "옮긴이",
-    "그린이": "그린이", "그림": "그린이", "일러스트": "그린이",
-    "사진": "사진", "감수": "감수", "편저": "편저", "편역": "편역",
-    "엮은이": "엮은이", "편집": "엮은이", "해설": "해설",
-}
-PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
-PRIMARY_LABEL = {"지은이": "지은이", "저자": "지은이", "글": "지은이", "글쓴이": "지은이", "": "지은이"}
 
 st.set_page_config(page_title="KORMARC 자동 생성기", page_icon="📚", layout="centered")
 
@@ -22,13 +12,14 @@ st.markdown("""
     font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
     text-transform: uppercase; color: #6c757d; margin: 14px 0 4px 0;
 }
-.status-ok  { background:#d4edda; color:#155724; border:1px solid #c3e6cb; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
-.status-wake{ background:#fff3cd; color:#856404; border:1px solid #ffeeba; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
+.status-ok   { background:#d4edda; color:#155724; border:1px solid #c3e6cb; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
+.status-wake { background:#fff3cd; color:#856404; border:1px solid #ffeeba; border-radius:6px; padding:8px 14px; font-size:13px; margin-bottom:12px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📚 KORMARC 자동 생성기")
-st.caption("알라딘 API 연동 · 245 / 246 / 700 / 710 / 900 / 940 필드 자동 생성")
+st.caption("알라딘 API 연동 · 245 / 246 / 500 / 700 / 710 / 900 필드 자동 생성")
+
 
 def check_server():
     try:
@@ -36,6 +27,7 @@ def check_server():
         return resp.status_code == 200
     except Exception:
         return False
+
 
 def wakeup_server():
     for _ in range(12):
@@ -48,9 +40,11 @@ def wakeup_server():
         time.sleep(5)
     return False
 
+
 @st.cache_data(ttl=60)
 def get_server_status():
     return check_server()
+
 
 server_ok = get_server_status()
 if server_ok:
@@ -63,11 +57,12 @@ st.divider()
 col1, col2 = st.columns([4, 1])
 with col1:
     isbn_input = st.text_input(
-        "ISBN", placeholder="ISBN-13 또는 ISBN-10  예) 9791124070871",
+        "ISBN", placeholder="ISBN-13 또는 ISBN-10 예) 9791124070871",
         label_visibility="collapsed", max_chars=17,
     )
 with col2:
     search = st.button("조회", use_container_width=True, type="primary")
+
 
 def fetch_book(isbn_clean):
     if not check_server():
@@ -90,15 +85,16 @@ def fetch_book(isbn_clean):
         st.error("서버 연결 오류: " + str(e))
         st.stop()
 
+
 if search and isbn_input:
     isbn_clean = isbn_input.replace("-", "").replace(" ", "")
     with st.spinner("도서 정보를 가져오는 중..."):
         resp = fetch_book(isbn_clean)
-        try:
-            data = resp.json()
-        except Exception:
-            st.error("응답을 읽을 수 없습니다. 다시 시도해주세요.")
-            st.stop()
+    try:
+        data = resp.json()
+    except Exception:
+        st.error("응답을 읽을 수 없습니다. 다시 시도해주세요.")
+        st.stop()
     if not resp.ok:
         st.error(data.get("error", "오류가 발생했습니다."))
         st.stop()
@@ -107,9 +103,12 @@ if search and isbn_input:
 elif search and not isbn_input:
     st.warning("ISBN을 입력해 주세요.")
 
+
 if "data" in st.session_state:
     data = st.session_state["data"]
+    marc = data.get("marc", {})
 
+    # ── 도서 기본 정보 ───────────────────────────
     col_img, col_info = st.columns([1, 3])
     with col_img:
         if data.get("cover"):
@@ -123,6 +122,8 @@ if "data" in st.session_state:
         st.markdown("**ISBN-13** `" + data.get("isbn13", "—") + "`")
 
     st.divider()
+
+    # ── 표제 수정 입력 ───────────────────────────
     st.info("✎ 표제·부제목을 수정하면 245 필드가 실시간 업데이트됩니다.")
 
     col_t, col_s, col_n = st.columns([3, 3, 1])
@@ -133,81 +134,71 @@ if "data" in st.session_state:
     with col_n:
         edit_part = st.text_input("$n 권차", value=data.get("part_number", ""), key="en")
 
-    authors = data.get("authors", [])
-    persons = [a for a in authors if not a.get("is_org")]
-    primary = [a for a in persons if a.get("role", "") in PRIMARY_ROLES]
-    secondary = [a for a in persons if a.get("role", "") not in PRIMARY_ROLES]
+    # ── 245 필드: 백엔드 값 기반으로 표제만 실시간 수정 ──
+    # 백엔드에서 내려온 f245에서 $a 이후 부분을 교체
+    f245_from_api = marc.get("f245", "")
 
-    role_groups = {}
-    for a in secondary:
-        lbl = ROLE_LABEL.get(a.get("role", ""), a.get("role", ""))
-        role_groups.setdefault(lbl, []).append(a)
+    # 표제/부제목/권차 수정이 있으면 $a~$b 부분만 교체, 나머지($d 이후)는 백엔드 값 유지
+    if f245_from_api:
+        # $d 이후 책임표시 부분 추출
+        resp_part = ""
+        if " /$d " in f245_from_api:
+            resp_part = " /$d " + f245_from_api.split(" /$d ", 1)[1]
+        elif " /$c " in f245_from_api:
+            resp_part = " /$c " + f245_from_api.split(" /$c ", 1)[1]
 
-    f245 = "$a " + edit_title
-    if edit_part:
-        f245 += " $n " + edit_part
-    if edit_subtitle:
-        f245 += " $b : " + edit_subtitle
+        # 표제 재조립
+        f245_body = "$a " + edit_title
+        if edit_part:
+            f245_body += " $n " + edit_part
+        if edit_subtitle:
+            f245_body += " $b : " + edit_subtitle
+        f245_body += resp_part
 
-    if primary:
-        pl = PRIMARY_LABEL.get(primary[0].get("role", ""), "지은이")
-        f245 += " /$d " + pl + ": " + primary[0]["name"]
-        for a in primary[1:]:
-            f245 += " ,$e " + PRIMARY_LABEL.get(a.get("role", ""), "지은이") + ": " + a["name"]
-        for lbl, members in role_groups.items():
-            for a in members:
-                f245 += " ;$e " + lbl + ": " + a["name"]
-    elif role_groups:
-        all_m = [m for ms in role_groups.values() for m in ms]
-        f245 += " /$d " + ROLE_LABEL.get(all_m[0].get("role", ""), all_m[0].get("role", "")) + ": " + all_m[0]["name"]
-        for a in all_m[1:]:
-            f245 += " ,$e " + ROLE_LABEL.get(a.get("role", ""), a.get("role", "")) + ": " + a["name"]
-
-    f245_full = "245 00 " + f245
+        f245_full = "245 00 " + f245_body
+    else:
+        f245_full = f245_from_api
 
     st.divider()
 
+    # ── MARC 필드 표시 ───────────────────────────
     st.markdown('<div class="marc-label">245 00 — 표제와 책임표시사항</div>', unsafe_allow_html=True)
     st.code(f245_full, language=None)
 
-    f246 = data["marc"].get("f246", "")
+    f246 = marc.get("f246", "")
     if f246:
         st.markdown('<div class="marc-label">246 19 — 원제</div>', unsafe_allow_html=True)
         st.code(f246, language=None)
 
-    f500 = data["marc"].get("f500", "")
+    f500 = marc.get("f500", "")
     if f500:
-        st.markdown('<div class="marc-label">500 \\\\ — 원저자명 주기 (한자)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="marc-label">500 \\\\ — 원저자명 주기</div>', unsafe_allow_html=True)
         st.code(f500, language=None)
 
-    f700_list = data["marc"].get("f700", [])
+    f700_list = marc.get("f700", [])
     if f700_list:
         st.markdown('<div class="marc-label">700 1_ — 개인명 부출기입</div>', unsafe_allow_html=True)
         st.code("\n".join(f700_list), language=None)
 
-    f710_list = data["marc"].get("f710", [])
+    f710_list = marc.get("f710", [])
     if f710_list:
         st.markdown('<div class="marc-label">710 0_ — 기관명 부출기입</div>', unsafe_allow_html=True)
         st.code("\n".join(f710_list), language=None)
 
-    f900_list = data["marc"].get("f900", [])
+    f900_list = marc.get("f900", [])
     if f900_list:
-        st.markdown('<div class="marc-label">900 10 — 한국어명 부출기입</div>', unsafe_allow_html=True)
+        st.markdown('<div class="marc-label">900 10 — 원저자 한글명 부출기입</div>', unsafe_allow_html=True)
         st.code("\n".join(f900_list), language=None)
-
-    f940_list = data["marc"].get("f940", [])
-    if f940_list:
-        st.markdown('<div class="marc-label">940 — 한국어 발음 표기</div>', unsafe_allow_html=True)
-        st.code("\n".join(f940_list), language=None)
 
     st.divider()
 
+    # ── 전체 복사용 ──────────────────────────────
     all_fields = [f245_full]
     if f246:
         all_fields.append(f246)
     if f500:
         all_fields.append(f500)
-    all_fields += f700_list + f710_list + f900_list + f940_list
+    all_fields += f700_list + f710_list + f900_list
 
     st.text_area(
         "📋 전체 MARC 필드 (복사용)",
@@ -217,10 +208,11 @@ if "data" in st.session_state:
     )
 
     st.divider()
+
     with st.expander("💡 서버 슬립 방지 (UptimeRobot 무료)"):
         st.markdown(f"""
 1. [uptimerobot.com](https://uptimerobot.com) 무료 가입
 2. **New Monitor** → Monitor Type: `HTTP(s)`
 3. URL: `{API_BASE}/health` / Interval: `5 minutes`
 4. 저장하면 5분마다 자동 핑 → 슬립 방지!
-        """)
+""")
