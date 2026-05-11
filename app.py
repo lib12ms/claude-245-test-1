@@ -1,29 +1,67 @@
+"""
+KORMARC 자동 생성기 - Flask 백엔드 (Render 배포용)
+
+알라딘 API를 이용해 ISBN으로 도서 정보를 조회하고
+KORMARC 245, 246, 500, 700, 710 필드를 자동 생성합니다.
+
+[데이터 소스 우선순위]
+  1순위: 알라딘 API + 상품 페이지 크롤링
+  2순위: Google Books API (알라딘에 정보 없을 때 폴백)
+
+[생성 필드]
+  245 00  표제와 책임표시사항
+  246 19  원서명 (번역서만)
+  500 __  원저자명 주기 (번역서만)
+  700 1_  개인명 부출기입
+  710 0_  기관명 부출기입
+
+[245 $c 책임표시사항 구성 규칙]
+  /$d 첫번째저자
+  ,$e 두번째저자 (공동저자, 반복)
+  ;$e 역자·그린이 등 역할어 다른 저자
+
+[246 구성 규칙]
+  역자가 있을 때만 생성
+  알라딘 원제 → Google Books title 순으로 폴백
+  246 19 $a 원서명.
+
+[500 구성 규칙]
+  역자가 있을 때만 생성
+  알라딘 상품 페이지 크롤링 → Google Books authors 순으로 폴백
+  500 __ $a 원저자명: Antoine De Saint-Exupery.
+
+[700 / 710 구성 규칙]
+  700 1_ $a 개인명, ← 개인 부출기입
+  710 0_ $a 기관명. ← 기관·단체·협의회 등
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+from bs4 import BeautifulSoup
 import re
 import os
-import urllib.request
-import urllib.error
-import urllib.parse
-import json
 
 app = Flask(__name__)
 CORS(app)
 
 ALADIN_API_KEY = os.environ.get("ALADIN_API_KEY", "ttbboyeong09010919001")
 ALADIN_API_URL = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
+GBOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
+GBOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")  # 없어도 하루 1000건 무료
 
 # ─────────────────────────────────────────────
 # 상수
 # ─────────────────────────────────────────────
-ORG_KEYWORDS = [
+ORG_KEYWORDS = (
     "협회", "학회", "위원회", "연구소", "연구원", "연구회", "센터",
-    "재단", "법인", "기관", "청", "공단", "공사", "협의회", "연합회",
-    "연맹", "조합", "대학교", "대학", "학교", "출판사", "출판부",
-    "association", "institute", "council", "committee", "foundation",
-    "university", "society", "organization", "corp", "inc", "ltd",
-]
+    "재단", "법인", "기관", "청", "공단", "공사",
+    "협의회", "연합회", "연맹", "조합",
+    "대학교", "대학", "학교", "출판사", "출판부",
+    "association", "institute", "council", "committee",
+    "foundation", "university", "society", "organization",
+    "corp", "inc", "ltd",
+)
 
 ROLE_LABEL = {
     "옮긴이": "옮긴이", "역자": "옮긴이", "번역": "옮긴이",
@@ -33,891 +71,55 @@ ROLE_LABEL = {
 }
 
 PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
-PRIMARY_LABEL = {
-    "지은이": "지은이", "저자": "지은이",
-    "글": "지은이", "글쓴이": "지은이", "": "지은이",
-}
-
-# 발음 변환 매핑
-EN_KO_MAP = {
-    "chatgpt": "챗지피티", "gpt": "지피티", "ai": "에이아이",
-    "api": "에이피아이", "ml": "엠엘", "nlp": "엔엘피",
-    "llm": "엘엘엠", "excel": "엑셀", "youtube": "유튜브",
-}
-
-DECIMAL_MAP = {
-    "2.0": "이점영", "3.0": "삼점영", "4.0": "사점영",
-}
-
-SINO = {"0":"영","1":"일","2":"이","3":"삼","4":"사","5":"오","6":"육","7":"칠","8":"팔","9":"구"}
+TRANS_ROLES   = {"옮긴이", "역자", "번역", "편역"}
 
 
 # ─────────────────────────────────────────────
-# 기본 헬퍼
+# 공통 유틸
 # ─────────────────────────────────────────────
-def is_org(name):
+def is_org(name: str) -> bool:
     return any(kw in name.lower() for kw in ORG_KEYWORDS)
 
-def is_korean(name):
-    return bool(re.search(r"[\uac00-\ud7a3]", name))
 
-def is_western(name):
-    return bool(re.search(r"[A-Za-z]", name)) and not is_korean(name)
-
-def invert_western(name):
-    parts = name.strip().split()
-    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
-
-def invert_korean(name):
-    parts = name.strip().split()
-    return parts[-1] + ", " + " ".join(parts[:-1]) if len(parts) >= 2 else name
-
-
-# ─────────────────────────────────────────────
-# 표제 분리 로직 개선 (괄호·전각문자 처리)
-# ─────────────────────────────────────────────
-DELIMS = [" : ", ": ", ":", " - ", " — ", "–", "—", " · ", "·", " | ", "|"]
-
-def compat_normalize(s):
-    if not s:
-        return ""
-    s = s.replace("：", ":").replace("－", "-").replace("‧", "·").replace("／", "/")
-    s = re.sub(r"[\u2000-\u200f\u202a-\u202e]", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-TRAIL_PAREN_PAT = re.compile(
-    r"\s*(?:[\(\[](개정|증보|개역|전정|합본|개정판|증보판|신판|보급판|초판|제?\d+\s*판|기념판)[)\]])\s*$",
-    re.IGNORECASE
-)
-
-def strip_trailing_paren_notes(s):
-    return TRAIL_PAREN_PAT.sub("", s).strip(" .,/;:-—·|")
-
-def clean_piece(s):
-    if not s:
-        return ""
-    s = compat_normalize(s)
-    s = strip_trailing_paren_notes(s)
-    s = s.strip(" .,/;:-—·|")
-    return s
-
-def find_top_level_split(text, delims=DELIMS):
-    pairs = {
-        "(": ")", "[": "]", "{": "}", "〈": "〉", "《": "》",
-        "「": "」", "『": "』", "\u201c": "\u201d", "\u2018": "\u2019", "«": "»"
-    }
-    opens = set(pairs.keys())
-    stack, i, L = [], 0, len(text)
-    while i < L:
-        ch = text[i]
-        if ch in opens:
-            stack.append(ch)
-            i += 1
-            continue
-        if stack and pairs.get(stack[-1]) == ch:
-            stack.pop()
-            i += 1
-            continue
-        if not stack:
-            for d in delims:
-                if text.startswith(d, i):
-                    return i, d
-        i += 1
-    return None
-
-def split_title_subtitle(raw_title, raw_sub=""):
-    """개선된 표제/부표제 분리"""
-    title = compat_normalize(raw_title)
-    subtitle = clean_piece(raw_sub)
-
-    # API가 부표제를 직접 주는 경우 우선 사용
-    if subtitle:
-        # 제목 끝에 부표제가 붙어있으면 제거
-        for pat in [f" : {subtitle}", f": {subtitle}", f" - {subtitle}"]:
-            if title.endswith(pat):
-                title = title[:-len(pat)]
-                break
-        return clean_piece(title), subtitle
-
-    # 괄호를 고려한 구분자 기반 분리
-    t = compat_normalize(title)
-    hit = find_top_level_split(t, DELIMS)
-    if not hit:
-        return clean_piece(t), ""
-    idx, delim = hit
-    left = t[:idx]
-    right = t[idx + len(delim):]
-    return clean_piece(left), clean_piece(right)
-
-
-# ─────────────────────────────────────────────
-# $n 권차 자동 분리
-# ─────────────────────────────────────────────
-PART_LABEL_RX = re.compile(
-    r"(?:제?\s*\d+\s*(?:권|부|편|책)|[IVXLCDM]+|[상중하]|[전후])$",
-    re.IGNORECASE
-)
-
-def split_part_number(title, subtitle, item):
-    """제목/부제에서 권차($n) 추출"""
-    a = title.strip()
-    n = ""
-
-    # 괄호형 권차: '자바의 정석 (제2권)'
-    m_paren = re.search(r"\s*[\(\[]\s*([^()\[\]]+)\s*[\)\]]\s*$", a)
-    if m_paren and PART_LABEL_RX.search(m_paren.group(1).strip()):
-        n_token = m_paren.group(1).strip()
-        a = a[:m_paren.start()].rstrip(" .,/;:-—·|")
-        m_num = re.search(r"\d+", n_token)
-        return a, subtitle, (m_num.group(0) if m_num else n_token)
-
-    # 라벨형: '자바의 정석 제2권'
-    m_label = re.search(r"\s*(제?\s*\d+\s*(?:권|부|편|책))\s*$", a, re.IGNORECASE)
-    if m_label:
-        a = a[:m_label.start()].rstrip(" .,/;:-—·|")
-        m_num = re.search(r"\d+", m_label.group(1))
-        return a, subtitle, (m_num.group(0) if m_num else m_label.group(1).strip())
-
-    # 상/중/하, 전/후
-    m_kor = re.search(r"\s*([상중하]|[전후])\s*$", a)
-    if m_kor:
-        a = a[:m_kor.start()].rstrip(" .,/;:-—·|")
-        return a, subtitle, m_kor.group(1)
-
-    # 로마숫자
-    if not re.fullmatch(r"[IVXLCDM]+", a, re.IGNORECASE):
-        m_roman = re.search(r"\s+([IVXLCDM]{2,})\s*$", a, re.IGNORECASE)
-        if m_roman:
-            a = a[:m_roman.start()].rstrip(" .,/;:-—·|")
-            return a, subtitle, m_roman.group(1)
-
-    return a, subtitle, n
-
-
-# ─────────────────────────────────────────────
-# 246 원제 필드
-# ─────────────────────────────────────────────
-YEAR_EDITION_PAT = re.compile(
-    r"\s*\(\s*(?:\d{3,4}\s*년?|rev(?:ised)?\.?\s*ed\.?|(?:\d+(?:st|nd|rd|th)\s*ed\.?)|edition|ed\.?|제?\s*\d+\s*판|개정(?:증보)?판?|증보판|초판|신판|보급판)[^()\[\]]*\)\s*$",
-    re.IGNORECASE
-)
-
-def build_246(item):
-    """알라딘 originalTitle에서 246 19 $a 생성"""
-    sub_info = item.get("subInfo") or {}
-    orig = (sub_info.get("originalTitle") or "").strip()
-    if not orig:
-        return ""
-    orig = clean_piece(orig)
-    orig = YEAR_EDITION_PAT.sub("", orig).strip()
-    if orig:
-        return "246 19 $a " + orig
-    return ""
-
-
-# ─────────────────────────────────────────────
-# 940 한국어 발음 표기
-# ─────────────────────────────────────────────
-def read_number(num_str):
-    """숫자를 한국어 발음으로 변환"""
-    n = int(num_str)
-    th = n // 1000
-    hu = (n // 100) % 10
-    te = (n // 10) % 10
-    on = n % 10
-    out = []
-    if th:
-        out.append(SINO[str(th)] + "천")
-    if hu:
-        out.append(SINO[str(hu)] + "백")
-    if te:
-        out.append("십" if te == 1 else SINO[str(te)] + "십")
-    if on:
-        out.append(SINO[str(on)])
-    return "".join(out) if out else "영"
-
-def read_digits(num_str):
-    return "".join(SINO.get(ch, ch) for ch in num_str)
-
-def replace_decimals(text):
-    for k, v in DECIMAL_MAP.items():
-        text = text.replace(k, v)
-    return text
-
-def replace_english(text):
-    def sub(m):
-        return EN_KO_MAP.get(m.group(0).lower(), m.group(0))
-    pattern = r"\b(" + "|".join(map(re.escape, EN_KO_MAP.keys())) + r")\b"
-    return re.sub(pattern, sub, text, flags=re.IGNORECASE)
-
-def build_940(title_a):
-    """제목에 숫자/영문이 있으면 한국어 발음 표기 940 필드 생성"""
-    base = (title_a or "").strip()
-    if not base:
-        return []
-    # 숫자/영문 없으면 생략
-    if not re.search(r"[0-9A-Za-z]", base):
-        return []
-
-    variants = set()
-
-    # 영문 치환 + 소수 치환
-    v1 = replace_decimals(base)
-    v1 = replace_english(v1)
-    if v1 != base:
-        variants.add(v1)
-
-    # 숫자 읽기 변형
-    nums = re.findall(r"\d{2,}", base)
-    if nums:
-        work = {replace_decimals(replace_english(base))}
-        for num in nums:
-            new_work = set()
-            candidates = set()
-            candidates.add(read_number(num))
-            candidates.add(read_digits(num))
-            if len(num) == 4 and 1000 <= int(num) <= 2999:
-                candidates.add(read_number(num))
-            for w in work:
-                for c in candidates:
-                    new_work.add(w.replace(num, c, 1))
-            work = new_work
-        variants |= work
-
-    # 940 필드 조립
-    result = []
-    seen = set()
-    for v in sorted(variants, key=len):
-        v = v.strip()
-        if not v or v == base or v in seen:
-            continue
-        if not re.search(r"[가-힣]", v):
-            continue
-        seen.add(v)
-        result.append("940 \\\\ $a " + v)
-
-    return result[:4]
-
-
-# ─────────────────────────────────────────────
-# VIAF 저자 국적 조회
-# ─────────────────────────────────────────────
-# VIAF에서 동아시아 관련 nationality 코드 (역순 변환 안 하는 국가들)
-EAST_ASIAN_NATIONALITIES = {
-    # 한국
-    "ko", "kor",
-    # 일본
-    "ja", "jpn", "jp",
-    # 중국
-    "zh", "chi", "zho", "cn",
-    # 대만
-    "tw",
-    # 베트남
-    "vi", "vie", "vn",
-}
-
-# VIAF 소스 중 동아시아 국립도서관 코드
-EAST_ASIAN_SOURCES = {
-    "NLSK", "NLK",        # 한국국립중앙도서관
-    "NDL",                # 일본국립국회도서관
-    "NLC",                # 중국국가도서관
-    "PLWABN",             # 폴란드 (제외용 아님, 동아시아만)
-}
-
-def get_viaf_nationality(name):
-    """
-    VIAF API로 저자 국적/언어 정보 조회.
-    반환: 'east_asian' / 'non_east_asian' / None(조회 실패)
-    동아시아(한국/일본/중국 등) 저자는 이름 도치 불필요.
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/javascript, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-        "Referer": "https://viaf.org/",
-    }
-    try:
-        search_url = "https://viaf.org/viaf/search"
-        params = {
-            "query": f'local.personalNames all "{name}"',
-            "maximumRecords": 3,
-            "startRecord": 1,
-            "httpAccept": "application/json",
-        }
-        resp = requests.get(search_url, params=params, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        records = (
-            data.get("searchRetrieveResponse", {})
-                .get("records", {})
-                .get("record", [])
-        )
-        if isinstance(records, dict):
-            records = [records]
-        if not records:
-            return None
-
-        record_data = records[0].get("recordData", {})
-        viaf_cluster = record_data.get("VIAFCluster", record_data)
-
-        # 방법 1: 동아시아 국립도서관 소스 확인 (NLK=한국, NDL=일본, NLC=중국)
-        sources = viaf_cluster.get("sources", {}).get("s", [])
-        if isinstance(sources, str):
-            sources = [sources]
-        for source in sources:
-            source_id = source.get("@id", "") if isinstance(source, dict) else str(source)
-            for es in EAST_ASIAN_SOURCES:
-                if es in source_id:
-                    return "east_asian"
-
-        # 방법 2: nationalityOfAssociatedName 필드 확인
-        nat_field = viaf_cluster.get("nationalityOfAssociatedName", {})
-        if isinstance(nat_field, dict):
-            nat_data = nat_field.get("data", [])
-            if isinstance(nat_data, dict):
-                nat_data = [nat_data]
-            for item in nat_data:
-                text = (item.get("text", "") or "").lower()
-                if text in EAST_ASIAN_NATIONALITIES:
-                    return "east_asian"
-
-        # 방법 3: VIAF ID 상세 조회
-        viaf_id = viaf_cluster.get("viafID") or viaf_cluster.get("@viafID")
-        if viaf_id:
-            detail_url = f"https://viaf.org/viaf/{viaf_id}/viaf.json"
-            resp2 = requests.get(detail_url, headers=headers, timeout=10)
-            if resp2.status_code == 200:
-                detail = resp2.json()
-                src_list = detail.get("sources", {}).get("s", [])
-                if isinstance(src_list, str):
-                    src_list = [src_list]
-                for src in src_list:
-                    src_id = src.get("@id", "") if isinstance(src, dict) else str(src)
-                    for es in EAST_ASIAN_SOURCES:
-                        if es in src_id:
-                            return "east_asian"
-                nat2 = detail.get("nationalityOfAssociatedName", {})
-                if isinstance(nat2, dict):
-                    nd = nat2.get("data", [])
-                    if isinstance(nd, dict):
-                        nd = [nd]
-                    for item in nd:
-                        text = (item.get("text", "") or "").lower()
-                        if text in EAST_ASIAN_NATIONALITIES:
-                            return "east_asian"
-
-        return "non_east_asian"
-    except Exception:
-        return None
-
-
-def is_east_asian_name_pattern(name):
-    """
-    VIAF 조회 실패 시 패턴 기반 동아시아 이름 판별 폴백.
-
-    규칙:
-    - 1어절 한국어 → 동아시아 (김영아, 한강, 위화)
-    - 2어절 한국어:
-        * 한 어절 6글자 이상 → 서양인 (미르탈리포바=6)
-        * 한 어절 5글자, 총 9글자 이하 → 동아시아 (아쿠타가와 류노스케=9)
-        * 한 어절 4글자 이하, 총 7글자 이하 → 동아시아 (무라카미 하루키=7)
-    - 3어절 이상 → 서양인 표기 (리베카 가딘 레빙턴)
-    """
-    name = name.strip()
-    parts = name.split()
-
-    if not all(re.fullmatch(r"[가-힣]+", p) for p in parts):
-        return False
-
-    # 1어절 → 항상 동아시아
-    if len(parts) == 1:
-        return True
-
-    max_len = max(len(p) for p in parts)
-    total = sum(len(p) for p in parts)
-
-    # 2어절
-    if len(parts) == 2:
-        if max_len >= 6:
-            return False  # 서양인 (미르탈리포바=6)
-        if max_len == 5 and total <= 9:
-            return True   # 일본인 성씨 (아쿠타가와 류노스케=9)
-        if max_len <= 4 and total <= 7:
-            return True   # 동아시아 (무라카미 하루키=7)
-
-    # 3어절 이상 → 서양인 표기
-    return False
-
-
-def is_east_asian_author_viaf(name):
-    """
-    VIAF 기반 동아시아 저자 여부 판별.
-    VIAF 조회 실패 시 이름 패턴으로 폴백.
-    """
-    result = get_viaf_nationality(name)
-    if result == "east_asian":
-        return True
-    if result == "non_east_asian":
-        return False
-    # VIAF 조회 실패 → 패턴 기반 폴백
-    return is_east_asian_name_pattern(name)
-
-
-def extract_original_names_from_aladin_page(link, names):
-    if not link or not names:
-        return {}, {}, {}
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-
-    result = {}
-    hanja_result = {}
-    # 동아시아 국적 여부: {이름: True/False/None}
-    nationality_result = {}
-
-    target_names = [n for n in names if not is_org(n)]
-
-    def detect_nationality_from_text(text, name):
-        """
-        저자 소개 텍스트에서 국적 판별.
-        단순 도시명 대신 '출생', '출신', '태어' 등과 조합해서 정확하게 감지.
-        """
-        idx = text.find(name)
-        if idx == -1:
-            return None
-        # 저자 이름 뒤 400자 범위 내에서만 검색
-        snippet = text[max(0, idx - 30) : idx + 400]
-
-        # 동아시아 국적 패턴 (도시명 + 출생/출신/태어 조합)
-        east_asian_patterns = [
-            # 일본
-            r"일본\s*(?:출생|출신|태생|에서\s*(?:태어|출생))",
-            r"(?:도쿄|교토|오사카|삿포로|나고야|요코하마|고베|후쿠오카|히로시마)\s*(?:출생|출신|에서\s*태어|에서\s*출생)",
-            r"(?:도쿄|교토|오사카)\s*\d{4}",  # 도쿄 1949년 같은 패턴
-            # 중국
-            r"중국\s*(?:출생|출신|태생|에서\s*(?:태어|출생))",
-            r"(?:베이징|상하이|광저우|청두|충칭)\s*(?:출생|출신|에서\s*태어)",
-            # 한국
-            r"한국\s*(?:출생|출신|태생)",
-            r"(?:서울|부산|대구|인천|광주|대전)\s*(?:출생|출신|에서\s*태어)",
-        ]
-
-        # 서양 국적 패턴
-        western_patterns = [
-            r"(?:프랑스|독일|영국|미국|이탈리아|스페인|러시아|오스트리아|스위스|"
-            r"노르웨이|스웨덴|덴마크|네덜란드|우즈베키스탄|카자흐스탄|알제리|"
-            r"아르헨티나|브라질|콜롬비아|칠레|멕시코|쿠바|이란|이스라엘|인도|"
-            r"파키스탄|터키|이집트|나이지리아|에티오피아)\s*(?:출생|출신|태생|에서\s*(?:태어|출생))",
-            r"(?:뉴욕|런던|파리|베를린|모스크바|로마|마드리드|비엔나|암스테르담)\s*(?:출생|출신|에서\s*태어)",
-        ]
-
-        for pat in east_asian_patterns:
-            if re.search(pat, snippet):
-                return "east_asian"
-
-        for pat in western_patterns:
-            if re.search(pat, snippet):
-                return "non_east_asian"
-
-        return None
-
-    try:
-        req = urllib.request.Request(link, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-
-        for name in target_names:
-            # 영문 원저자명 패턴
-            pattern = re.compile(
-                rf"{re.escape(name)}\s*\(\s*([A-Za-z][A-Za-z .,'-]+)\s*\)",
-                re.IGNORECASE
-            )
-            match = pattern.search(html)
-            if match:
-                result[name] = match.group(1).strip()
-
-            # 한자 원저자명 패턴
-            hanja_pattern = re.compile(
-                rf"{re.escape(name)}\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
-                re.IGNORECASE
-            )
-            hanja_match = hanja_pattern.search(html)
-            if hanja_match:
-                hanja_result[name] = hanja_match.group(1).strip()
-
-            # 상품 페이지에서 국적 판별
-            nat = detect_nationality_from_text(html, name)
-            if nat:
-                nationality_result[name] = nat
-
-        # 저자 소개 페이지 추가 크롤링
-        author_search_values = re.findall(
-            r"AuthorSearch=([^\"'&\s]+)", html, flags=re.IGNORECASE
-        )
-        author_search_values = list(dict.fromkeys(author_search_values))
-
-        for value in author_search_values:
-            author_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={value}"
-            try:
-                req2 = urllib.request.Request(author_url, headers=headers)
-                with urllib.request.urlopen(req2, timeout=12) as resp2:
-                    author_html = resp2.read().decode("utf-8", errors="ignore")
-
-                # 영문 원저자명
-                pairs = re.findall(
-                    r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([A-Za-z][A-Za-z .,'-]{1,80})\s*\)",
-                    author_html
-                )
-                for kor_name, orig_name in pairs:
-                    kn = kor_name.strip()
-                    on = orig_name.strip()
-                    if kn in target_names and kn not in result:
-                        result[kn] = on
-
-                # 한자 원저자명
-                hanja_pairs = re.findall(
-                    r"([가-힣][가-힣\s.\-]{0,40})\s*\(\s*([\u4e00-\u9fff\u3040-\u30ff][\u4e00-\u9fff\u3040-\u30ff\s·]+)\s*\)",
-                    author_html
-                )
-                for kor_name, hanja_name in hanja_pairs:
-                    kn = kor_name.strip()
-                    hn = hanja_name.strip()
-                    if kn in target_names and kn not in hanja_result:
-                        hanja_result[kn] = hn
-
-                # 저자 소개 페이지에서 국적 판별
-                for name in target_names:
-                    if name not in nationality_result:
-                        nat = detect_nationality_from_text(author_html, name)
-                        if nat:
-                            nationality_result[name] = nat
-
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return result, hanja_result, nationality_result
-
-
-# ─────────────────────────────────────────────
-# 저자 파싱
-# ─────────────────────────────────────────────
-def parse_authors(author_str, page_link=""):
-    result = []
-    found = set()
-
-    # 케이스 1: 한국어이름 (영문원어명) (역할)
-    p1 = re.findall(
-        r"([^,]+?)\s*\(([A-Za-z][^)]*)\)\s*\(([^)]+)\)",
-        author_str
-    )
-    for kor_name, original, role in p1:
-        kor_name = kor_name.strip()
-        if not is_korean(kor_name):
-            continue
-        result.append({
-            "name": kor_name,
-            "role": role.strip(),
-            "is_org": is_org(kor_name),
-            "original_name": original.strip(),
-            "hanja_name": "",
-            "nationality": None,
-        })
-        found.add(kor_name)
-
-    # 케이스 2: 이름 (역할) — 단일 또는 쉼표 나열 후 마지막에 역할어
-    # 예1: 아쿠타가와 류노스케 (지은이)
-    # 예2: 나쓰메 소세키, 다자이 오사무, 아쿠타가와 류노스케 (지은이) → 모두 지은이
-    p2 = re.findall(r"([^(]+?)\s*\(([^)]+)\)", author_str)
-    for names_part, info in p2:
-        info = info.strip()
-        # 영문 원어명은 건너뜀 (케이스 1에서 처리)
-        if re.search(r"[A-Za-z]", info) and not is_korean(info):
-            continue
-        # 쉼표로 나열된 이름들 분리
-        name_list = [n.strip() for n in names_part.split(",") if n.strip()]
-        for name in name_list:
-            if not name or is_western(name) or name in found:
-                continue
-            result.append({
-                "name": name,
-                "role": info,
-                "is_org": is_org(name),
-                "original_name": "",
-                "hanja_name": "",
-                "nationality": None,
-            })
-            found.add(name)
-
-    if not result:
+def to_title_case(word: str) -> str:
+    """SAINT-EXUPERY → Saint-Exupery"""
+    return "-".join(part.capitalize() for part in word.split("-"))
+
+
+def parse_authors(author_str: str) -> list[dict]:
+    result  = []
+    pattern = re.findall(r"([^,(]+?)\s*\(([^)]+)\)", author_str)
+    if pattern:
+        for name, role in pattern:
+            name = name.strip()
+            result.append({"name": name, "role": role.strip(), "is_org": is_org(name)})
+    else:
         for name in author_str.split(","):
             name = name.strip()
             if name:
-                result.append({
-                    "name": name, "role": "", "is_org": is_org(name),
-                    "original_name": "", "hanja_name": "", "nationality": None,
-                })
-
-    # 페이지 크롤링으로 영문·한자 원저자명 + 국적 정보 보강
-    if page_link:
-        all_persons = [
-            a["name"] for a in result
-            if not a["is_org"] and is_korean(a["name"])
-        ]
-        if all_persons:
-            scraped, hanja_scraped, nat_scraped = extract_original_names_from_aladin_page(page_link, all_persons)
-            for a in result:
-                if a["name"] in scraped and not a["original_name"]:
-                    a["original_name"] = scraped[a["name"]]
-                if a["name"] in hanja_scraped:
-                    a["hanja_name"] = hanja_scraped[a["name"]]
-                if a["name"] in nat_scraped:
-                    a["nationality"] = nat_scraped[a["name"]]
-
+                result.append({"name": name, "role": "", "is_org": is_org(name)})
     return result
 
 
-# ─────────────────────────────────────────────
-# MARC 필드 생성
-# ─────────────────────────────────────────────
-def build_245(title, subtitle, part_number, authors):
-    a_part = title.strip()
-    b_part = subtitle.strip() if subtitle else ""
-
-    persons = [a for a in authors if not a["is_org"]]
-    primary = [a for a in persons if a["role"] in PRIMARY_ROLES]
-    secondary = [a for a in persons if a["role"] not in PRIMARY_ROLES]
-
-    role_groups = {}
-    for a in secondary:
-        label = ROLE_LABEL.get(a["role"], a["role"])
-        role_groups.setdefault(label, []).append(a)
-
-    field = "$a " + a_part
-
-    # $n 권차
-    if part_number:
-        field += " $n " + part_number
-
-    if b_part:
-        field += " $b : " + b_part
-
-    if primary:
-        p_label = PRIMARY_LABEL.get(primary[0]["role"], "지은이")
-        field += " /$d " + p_label + ": " + primary[0]["name"]
-        for a in primary[1:]:
-            pl = PRIMARY_LABEL.get(a["role"], "지은이")
-            field += " ,$e " + pl + ": " + a["name"]
-        for label, members in role_groups.items():
-            for a in members:
-                field += " ;$e " + label + ": " + a["name"]
-    elif role_groups:
-        all_members = []
-        for members in role_groups.values():
-            all_members.extend(members)
-        first_lbl = ROLE_LABEL.get(all_members[0]["role"], all_members[0]["role"])
-        field += " /$d " + first_lbl + ": " + all_members[0]["name"]
-        for a in all_members[1:]:
-            lbl = ROLE_LABEL.get(a["role"], a["role"])
-            field += " ,$e " + lbl + ": " + a["name"]
-
-    return field
-
-
-def build_500(authors):
-    """
-    500 \\ $a 원저자명 주기 생성.
-    영문 원저자명(original_name)과 한자 원저자명(hanja_name) 모두 포함.
-
-    예1: 500 \\ $a 원저자명: Sigrid Nunez
-    예2: 500 \\ $a 원저자명: 村上春樹, 安西 水丸
-    예3: 500 \\ $a 원저자명: Dinara Mirtalipova ; 村上春樹
-    """
-    original_names = []  # 영문 원저자명
-    hanja_names = []     # 한자 원저자명
-
-    for a in authors:
-        original = a.get("original_name", "").strip()
-        hanja = a.get("hanja_name", "").strip()
-        if original and is_western(original):
-            original_names.append(original)
-        if hanja:
-            hanja_names.append(hanja)
-
-    if not original_names and not hanja_names:
-        return ""
-
-    parts = []
-    if original_names:
-        parts.append(", ".join(original_names))
-    if hanja_names:
-        parts.append(", ".join(hanja_names))
-
-    return "500 \\\\ $a 원저자명: " + " ; ".join(parts)
-
-
-
-    """
-    원어명 있음  → 원어명 역순:                     Nunez, Sigrid
-    원어명 없음 + 한국어 2어절 이상:
-      - VIAF로 동아시아인 확인 → 그대로:            무라카미 하루키
-      - VIAF로 비동아시아인 확인 → 역순:            레빙턴, 리베카 가딘
-    한국어 단일 이름 (2~5글자 공백없음) → 그대로:   김영아
-    """
-    name = author["name"].strip()
-    original = author.get("original_name", "").strip()
-
-    # 원어명 있으면 원어명 역순
-    if original and is_western(original):
-        return "$a " + invert_western(original)
-
-    # 한국어 단일 이름 (공백 없는 2~5글자) → 동아시아인, 그대로
-    if re.fullmatch(r"[가-힣]{2,5}", name):
-        return "$a " + name
-
-    # 한국어 2어절 이상 → VIAF로 동아시아인 여부 판별
-    if is_korean(name) and len(name.split()) >= 2:
-        east_asian = is_east_asian_author_viaf(name)
-        if east_asian:
-            return "$a " + name                 # 동아시아인 → 그대로
-        else:
-            return "$a " + invert_korean(name)  # 서양인 한국어 표기 → 역순
-
-    return "$a " + name
-
-def build_700(author):
-    """
-    700 1_ 개인명 부출기입 도치 방식:
-
-    1. 영문 원어명 있음 → 원어명 역순:              Nunez, Sigrid
-    2. 한자 원저자명 있음 → 동아시아 확정 → 그대로: 무라카미 하루키
-    3. 알라딘 크롤링 국적 정보 있음 → 국적으로 판별
-    4. 한국어 단일 이름 (1어절) → 항상 그대로:      김영아
-    5. VIAF 조회 → 패턴 폴백
-    """
-    name = author["name"].strip()
-    original = author.get("original_name", "").strip()
-    hanja = author.get("hanja_name", "").strip()
-    nationality = author.get("nationality")  # 'east_asian' / 'non_east_asian' / None
-
-    # 1. 영문 원어명 → 원어명 역순
-    if original and is_western(original):
-        return "$a " + invert_western(original)
-
-    # 2. 한자 원저자명 → 동아시아 확정 → 그대로
-    if hanja:
-        return "$a " + name
-
-    # 3. 알라딘 크롤링 국적 정보 활용
-    if nationality == "east_asian":
-        return "$a " + name
-    if nationality == "non_east_asian":
-        if is_korean(name) and len(name.split()) >= 2:
-            return "$a " + invert_korean(name)
-        return "$a " + name
-
-    # 4. 한국어 단일 이름 → 그대로
-    if re.fullmatch(r"[가-힣]{2,5}", name):
-        return "$a " + name
-
-    # 5. 한국어 2어절 이상 → VIAF → 패턴 폴백
-    if is_korean(name) and len(name.split()) >= 2:
-        east_asian = is_east_asian_author_viaf(name)
-        if east_asian:
-            return "$a " + name
-        else:
-            return "$a " + invert_korean(name)
-
-    return "$a " + name
-
-
-def build_900(author):
-    """원어명 있는 저자만 → 한국어 역순"""
-    name = author["name"].strip()
-    original = author.get("original_name", "").strip()
-    if original and is_western(original) and is_korean(name):
-        return "900 10 $a " + invert_korean(name)
-    return ""
-
-
-def build_710(author):
-    return "710 0_ $a " + author["name"].strip() + "."
-
-
-def to_isbn13(isbn):
+def to_isbn13(isbn: str) -> str:
     if len(isbn) == 13:
         return isbn
-    base = "978" + isbn[:9]
+    base  = "978" + isbn[:9]
     check = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(base))
     return base + str((10 - check % 10) % 10)
 
 
-GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
-GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
-
-
-def fetch_google_books(isbn13):
-    """
-    Google Books API로 도서 정보 조회.
-    반환: {
-        "original_title": 원서명,
-        "original_authors": [원저자명, ...],
-    }
-    """
-    if not GOOGLE_BOOKS_API_KEY:
-        return {}
-    try:
-        params = {
-            "q": f"isbn:{isbn13}",
-            "key": GOOGLE_BOOKS_API_KEY,
-        }
-        resp = requests.get(GOOGLE_BOOKS_API_URL, params=params, timeout=10)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            return {}
-
-        vol = items[0].get("volumeInfo", {})
-        result = {}
-
-        # 원서명
-        title = vol.get("title", "").strip()
-        subtitle = vol.get("subtitle", "").strip()
-        if title:
-            result["original_title"] = (title + " : " + subtitle) if subtitle else title
-
-        # 원저자명
-        authors = vol.get("authors", [])
-        if authors:
-            result["original_authors"] = authors
-
-        return result
-    except Exception:
-        return {}
-
-
-def fetch_aladin(isbn):
+# ─────────────────────────────────────────────
+# 알라딘 API
+# ─────────────────────────────────────────────
+def fetch_aladin(isbn: str) -> dict:
     params = {
-        "ttbkey": ALADIN_API_KEY,
+        "ttbkey":     ALADIN_API_KEY,
         "itemIdType": "ISBN13",
-        "ItemId": isbn,
-        "output": "js",
-        "Version": "20131101",
-        "OptResult": "authors,subInfo",
+        "ItemId":     isbn,
+        "output":     "js",
+        "Version":    "20131101",
+        "OptResult":  "authors,subInfo",
     }
     resp = requests.get(ALADIN_API_URL, params=params, timeout=10)
     resp.raise_for_status()
@@ -928,13 +130,170 @@ def fetch_aladin(isbn):
 
 
 # ─────────────────────────────────────────────
-# API 엔드포인트
+# 알라딘 상품 페이지 크롤링
 # ─────────────────────────────────────────────
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+def scrape_aladin_page(item_id: str) -> dict:
+    """
+    알라딘 상품 페이지의 '원제' 링크에서 원서명·원저자 영문명을 추출합니다.
+
+    링크 형태:
+      href="...SearchTarget=Foreign&SearchWord=Le+Petit+Prince+ANTOINE+DE+SAINT-EXUPERY"
+
+    - ALL CAPS 단어 → 원저자명
+    - 그 외 단어    → 원서명
+    """
+    result = {"orig_title": None, "orig_author_en": None}
+    if not item_id:
+        return result
+
+    url     = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return result
+
+    soup      = BeautifulSoup(resp.text, "html.parser")
+    orig_link = soup.find("a", href=re.compile(r"SearchTarget=Foreign&SearchWord="))
+
+    if orig_link:
+        href  = orig_link.get("href", "")
+        match = re.search(r"SearchWord=([^&\"]+)", href)
+        if match:
+            raw   = match.group(1).replace("+", " ").strip()
+            parts = raw.split()
+
+            # ALL CAPS(하이픈 허용) 단어 → 저자명
+            author_parts = [p for p in parts if re.sub(r"[-']", "", p).isupper() and len(p) > 1]
+            title_parts  = [p for p in parts if p not in author_parts]
+
+            if title_parts:
+                result["orig_title"] = " ".join(title_parts)
+            if author_parts:
+                result["orig_author_en"] = " ".join(to_title_case(p) for p in author_parts)
+
+    return result
 
 
+# ─────────────────────────────────────────────
+# Google Books API 폴백
+# ─────────────────────────────────────────────
+def fetch_google_books(isbn13: str) -> dict:
+    """
+    Google Books API로 원서명·원저자 영문명을 조회합니다.
+    알라딘에서 정보를 못 가져왔을 때만 호출됩니다.
+
+    반환: {"orig_title": str|None, "orig_author_en": str|None}
+    """
+    result = {"orig_title": None, "orig_author_en": None}
+
+    params: dict = {"q": f"isbn:{isbn13}"}
+    if GBOOKS_API_KEY:
+        params["key"] = GBOOKS_API_KEY
+
+    try:
+        resp = requests.get(GBOOKS_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        return result
+
+    items = data.get("items", [])
+    if not items:
+        return result
+
+    info       = items[0].get("volumeInfo", {})
+    g_title    = info.get("title", "").strip()
+    g_subtitle = info.get("subtitle", "").strip()
+    g_authors  = info.get("authors", [])
+
+    if g_title:
+        result["orig_title"] = f"{g_title} : {g_subtitle}" if g_subtitle else g_title
+
+    if g_authors:
+        result["orig_author_en"] = g_authors[0].strip()
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# MARC 필드 빌더
+# ─────────────────────────────────────────────
+def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
+    a_part    = title.strip()
+    b_part    = subtitle.strip() if subtitle else ""
+    persons   = [a for a in authors if not a["is_org"]]
+    primary   = [a for a in persons if a["role"] in PRIMARY_ROLES]
+    secondary = [a for a in persons if a["role"] not in PRIMARY_ROLES]
+
+    role_groups: dict[str, list[str]] = {}
+    for a in secondary:
+        label = ROLE_LABEL.get(a["role"], a["role"])
+        role_groups.setdefault(label, []).append(a["name"])
+
+    field = f"$a {a_part}"
+    if b_part:
+        field += f" $b : {b_part}"
+
+    if primary:
+        field += f" /$d {primary[0]['name']}"
+        for a in primary[1:]:
+            field += f" ,$e {a['name']}"
+        for label, names in role_groups.items():
+            for name in names:
+                field += f" ;$e {name}"
+        field += "."
+    elif role_groups:
+        all_names = [n for ns in role_groups.values() for n in ns]
+        field += f" /$d {all_names[0]}"
+        for name in all_names[1:]:
+            field += f" ,$e {name}"
+        field += "."
+    else:
+        field += "."
+
+    return field
+
+
+def build_246(orig_title: str | None) -> str | None:
+    """246 19 — 원서명 (번역서 + 원제 있을 때만)"""
+    if not orig_title:
+        return None
+    return f"246 19 $a {orig_title.strip()}."
+
+
+def build_500(orig_author_en: str | None) -> str | None:
+    """500 __ — 원저자명 주기 (번역서 + 영문명 있을 때만)"""
+    if not orig_author_en:
+        return None
+    return f"500 __ $a 원저자명: {orig_author_en.strip()}."
+
+
+def build_700(author: dict) -> str:
+    name = author["name"].strip()
+    # 영문 이름이면 성, 이름 역순 변환
+    if re.search(r"[A-Za-z]", name) and not re.search(r"[\uac00-\ud7a3]", name):
+        parts = name.split()
+        if len(parts) >= 2:
+            name = f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return f"$a {name},"
+
+
+def build_710(author: dict) -> str:
+    return f"$a {author['name'].strip()}."
+
+
+# ─────────────────────────────────────────────
+# 라우트
+# ─────────────────────────────────────────────
 @app.route("/api/isbn", methods=["GET"])
 def isbn_lookup():
     isbn = request.args.get("isbn", "").replace("-", "").strip()
@@ -949,104 +308,85 @@ def isbn_lookup():
         item = fetch_aladin(isbn13)
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
-    except Exception as e:
-        return jsonify({"error": "알라딘 API 오류: " + str(e)}), 502
+    except requests.RequestException as e:
+        return jsonify({"error": f"알라딘 API 오류: {e}"}), 502
 
-    # 개선된 표제/부표제 분리
-    raw_title = item.get("title", "")
-    raw_sub = (item.get("subInfo") or {}).get("subTitle") or ""
-    title, subtitle = split_title_subtitle(raw_title, raw_sub)
+    # ── 표제 / 부제목 분리 ──────────────────────────
+    title    = item.get("title", "")
+    subtitle = ""
 
-    # $n 권차 분리
-    title, subtitle, part_number = split_part_number(title, subtitle, item)
+    sub_info = item.get("subInfo", {})
+    if isinstance(sub_info, dict):
+        api_sub = sub_info.get("subTitle", "").strip()
+        if api_sub and title.endswith(api_sub):
+            title    = title[: -len(api_sub)].rstrip(" -:").strip()
+            subtitle = api_sub
+        elif api_sub:
+            subtitle = api_sub
 
-    # 저자 파싱
-    author_str = item.get("author", "")
-    page_link = item.get("link", "")
-    authors = parse_authors(author_str, page_link)
+    if not subtitle:
+        for sep in (" - ", " : "):
+            if sep in title:
+                t, s            = title.split(sep, 1)
+                title, subtitle = t.strip(), s.strip()
+                break
 
-    # 245 필드
-    field_245 = build_245(title, subtitle, part_number, authors)
+    author_str     = item.get("author", "")
+    authors        = parse_authors(author_str)
+    item_id        = str(item.get("itemId", ""))
+    has_translator = any(a["role"] in TRANS_ROLES for a in authors)
 
-    # 246 원제 필드
-    field_246 = build_246(item)
+    # ── 원제 · 원저자 영문명 수집 ───────────────────
+    orig_title:     str | None = None
+    orig_author_en: str | None = None
 
-    # 500 원저자명 주기
-    field_500 = build_500(authors)
+    if has_translator:
+        # 1순위: 알라딘 상품 페이지 크롤링
+        scraped        = scrape_aladin_page(item_id)
+        orig_title     = scraped["orig_title"]
+        orig_author_en = scraped["orig_author_en"]
 
-    # Google Books API로 빈 필드 보완
-    gb_data = {}
-    if not field_246 or not field_500:
-        gb_data = fetch_google_books(isbn13)
+        # 2순위: 없는 항목만 Google Books로 폴백
+        if not orig_title or not orig_author_en:
+            gbooks = fetch_google_books(isbn13)
+            if not orig_title:
+                orig_title = gbooks["orig_title"]
+            if not orig_author_en:
+                orig_author_en = gbooks["orig_author_en"]
 
-    # 246 원제: 알라딘에서 못 가져왔으면 Google Books에서 보완
-    if not field_246 and gb_data.get("original_title"):
-        field_246 = "246 19 $a " + gb_data["original_title"]
+    # ── MARC 필드 생성 ──────────────────────────────
+    field_245 = build_245(title, subtitle, authors)
+    field_246 = build_246(orig_title)      # 없으면 None
+    field_500 = build_500(orig_author_en)  # 없으면 None
 
-    # 원저자명 보완: Google Books 원저자명으로 500 필드 강화
-    if gb_data.get("original_authors"):
-        gb_authors = gb_data["original_authors"]
-        # 기존 authors에서 원저자명 없는 저자에게 Google Books 원저자명 매핑
-        persons_without_original = [
-            a for a in authors
-            if not a.get("original_name") and not a.get("hanja_name") and not a["is_org"]
-        ]
-        # 저자 수가 같으면 순서대로 매핑
-        if len(persons_without_original) == len(gb_authors):
-            for a, gb_name in zip(persons_without_original, gb_authors):
-                a["original_name"] = gb_name
-        elif len(gb_authors) >= 1 and len(persons_without_original) >= 1:
-            # 첫 번째 저자만 매핑
-            persons_without_original[0]["original_name"] = gb_authors[0]
+    persons    = [a for a in authors if not a["is_org"]]
+    fields_700 = [f"700 1_ {build_700(a)}" for a in persons]
 
-        # 500 필드 재생성
-        field_500 = build_500(authors)
-
-        # 700 필드도 재생성 (원저자명 업데이트 반영)
-        persons = [a for a in authors if not a["is_org"]]
-        fields_700 = ["700 1_ " + build_700(a) for a in persons]
-        fields_900 = []
-        for a in persons:
-            r = build_900(a)
-            if r:
-                fields_900.append(r)
-
-    # 700 / 900 / 710 필드 (Google Books 보완 후 최종 생성)
-    persons = [a for a in authors if not a["is_org"]]
-    fields_700 = ["700 1_ " + build_700(a) for a in persons]
-
-    fields_900 = []
-    for a in persons:
-        r = build_900(a)
-        if r:
-            fields_900.append(r)
-
-    orgs = [a for a in authors if a["is_org"]]
-    fields_710 = ["710 0_ " + build_710(a) for a in orgs]
-
-    # 940 한국어 발음 표기
-    fields_940 = build_940(title)
+    orgs       = [a for a in authors if a["is_org"]]
+    fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
 
     return jsonify({
-        "isbn13": isbn13,
-        "title": title,
-        "subtitle": subtitle,
-        "part_number": part_number,
+        "isbn13":     isbn13,
+        "title":      title,
+        "subtitle":   subtitle,
         "author_raw": author_str,
-        "authors": authors,
-        "publisher": item.get("publisher", ""),
-        "pub_date": item.get("pubDate", ""),
-        "cover": item.get("cover", ""),
+        "authors":    authors,
+        "publisher":  item.get("publisher", ""),
+        "pub_date":   item.get("pubDate", ""),
+        "cover":      item.get("cover", ""),
         "marc": {
-            "f245": "245 00 " + field_245,
-            "f246": field_246,
-            "f500": field_500,
+            "f245": f"245 00 {field_245}",
+            "f246": field_246,   # 번역서 + 원제 있을 때만, 없으면 null
+            "f500": field_500,   # 번역서 + 원저자 영문명 있을 때만, 없으면 null
             "f700": fields_700,
             "f710": fields_710,
-            "f900": fields_900,
-            "f940": fields_940,
         }
     })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":
