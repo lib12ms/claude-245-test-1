@@ -739,19 +739,33 @@ def build_245(title, subtitle, part_number, authors):
 def build_500(authors):
     """
     500 \\ $a 원저자명 주기 생성.
-    한자(일본어/중국어) 원저자명이 있는 저자들을 쉼표로 나열.
-    예: 500 \\ $a 원저자명: 村上春樹, 安西 水丸
+    영문 원저자명(original_name)과 한자 원저자명(hanja_name) 모두 포함.
+
+    예1: 500 \\ $a 원저자명: Sigrid Nunez
+    예2: 500 \\ $a 원저자명: 村上春樹, 安西 水丸
+    예3: 500 \\ $a 원저자명: Dinara Mirtalipova ; 村上春樹
     """
-    hanja_names = []
+    original_names = []  # 영문 원저자명
+    hanja_names = []     # 한자 원저자명
+
     for a in authors:
+        original = a.get("original_name", "").strip()
         hanja = a.get("hanja_name", "").strip()
+        if original and is_western(original):
+            original_names.append(original)
         if hanja:
             hanja_names.append(hanja)
 
-    if not hanja_names:
+    if not original_names and not hanja_names:
         return ""
 
-    return "500 \\\\ $a 원저자명: " + ", ".join(hanja_names)
+    parts = []
+    if original_names:
+        parts.append(", ".join(original_names))
+    if hanja_names:
+        parts.append(", ".join(hanja_names))
+
+    return "500 \\\\ $a 원저자명: " + " ; ".join(parts)
 
 
 
@@ -850,6 +864,52 @@ def to_isbn13(isbn):
     return base + str((10 - check % 10) % 10)
 
 
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
+GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
+
+
+def fetch_google_books(isbn13):
+    """
+    Google Books API로 도서 정보 조회.
+    반환: {
+        "original_title": 원서명,
+        "original_authors": [원저자명, ...],
+    }
+    """
+    if not GOOGLE_BOOKS_API_KEY:
+        return {}
+    try:
+        params = {
+            "q": f"isbn:{isbn13}",
+            "key": GOOGLE_BOOKS_API_KEY,
+        }
+        resp = requests.get(GOOGLE_BOOKS_API_URL, params=params, timeout=10)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            return {}
+
+        vol = items[0].get("volumeInfo", {})
+        result = {}
+
+        # 원서명
+        title = vol.get("title", "").strip()
+        subtitle = vol.get("subtitle", "").strip()
+        if title:
+            result["original_title"] = (title + " : " + subtitle) if subtitle else title
+
+        # 원저자명
+        authors = vol.get("authors", [])
+        if authors:
+            result["original_authors"] = authors
+
+        return result
+    except Exception:
+        return {}
+
+
 def fetch_aladin(isbn):
     params = {
         "ttbkey": ALADIN_API_KEY,
@@ -911,10 +971,47 @@ def isbn_lookup():
     # 246 원제 필드
     field_246 = build_246(item)
 
-    # 500 원저자명 주기 (한자 원저자명)
+    # 500 원저자명 주기
     field_500 = build_500(authors)
 
-    # 700 / 900 / 710 필드
+    # Google Books API로 빈 필드 보완
+    gb_data = {}
+    if not field_246 or not field_500:
+        gb_data = fetch_google_books(isbn13)
+
+    # 246 원제: 알라딘에서 못 가져왔으면 Google Books에서 보완
+    if not field_246 and gb_data.get("original_title"):
+        field_246 = "246 19 $a " + gb_data["original_title"]
+
+    # 원저자명 보완: Google Books 원저자명으로 500 필드 강화
+    if gb_data.get("original_authors"):
+        gb_authors = gb_data["original_authors"]
+        # 기존 authors에서 원저자명 없는 저자에게 Google Books 원저자명 매핑
+        persons_without_original = [
+            a for a in authors
+            if not a.get("original_name") and not a.get("hanja_name") and not a["is_org"]
+        ]
+        # 저자 수가 같으면 순서대로 매핑
+        if len(persons_without_original) == len(gb_authors):
+            for a, gb_name in zip(persons_without_original, gb_authors):
+                a["original_name"] = gb_name
+        elif len(gb_authors) >= 1 and len(persons_without_original) >= 1:
+            # 첫 번째 저자만 매핑
+            persons_without_original[0]["original_name"] = gb_authors[0]
+
+        # 500 필드 재생성
+        field_500 = build_500(authors)
+
+        # 700 필드도 재생성 (원저자명 업데이트 반영)
+        persons = [a for a in authors if not a["is_org"]]
+        fields_700 = ["700 1_ " + build_700(a) for a in persons]
+        fields_900 = []
+        for a in persons:
+            r = build_900(a)
+            if r:
+                fields_900.append(r)
+
+    # 700 / 900 / 710 필드 (Google Books 보완 후 최종 생성)
     persons = [a for a in authors if not a["is_org"]]
     fields_700 = ["700 1_ " + build_700(a) for a in persons]
 
