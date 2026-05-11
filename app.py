@@ -1,27 +1,19 @@
 """
 KORMARC 자동 생성기 - Flask 백엔드 (Render 배포용)
 
-알라딘 API를 이용해 ISBN으로 도서 정보를 조회하고
-KORMARC 245, 246, 500, 700, 710, 900 필드를 자동 생성합니다.
+[생성 필드]
+  245 00  표제와 책임표시사항
+  246 19  원서명 (번역서만)
+  500 __  원저자명 주기 (번역서만, 한자명 포함)
+  700 1_  개인명 부출기입
+  710 0_  기관명 부출기입
+  900 10  원저자 한글명 부출 (동아시아 저자는 도치 안 함)
 
 [원제·원저자 수집 전략]
-
-  ① 원제 찾기
-     1순위: 알라딘 API subInfo.originalTitle
-     2순위: 알라딘 상품 페이지 크롤링 (원제 링크)
-     3순위: Google Books에 "한글 제목 + 저자 한글명" 으로 검색 → volumeInfo.title
-
-  ② 원저자 영문명 찾기
-     1순위: 알라딘 상품 페이지 크롤링 (원제 링크 ALL CAPS 단어)
-     2순위: ①에서 찾은 원제로 Google Books 재검색 → volumeInfo.authors
-
-[생성 필드]
-  245 00  표제와 책임표시사항 (총서명 제거)
-  246 19  원서명 (번역서만, 연도 제거)
-  500 __  원저자명 주기 (번역서만, 이름 정순)
-  700 1_  개인명 부출기입 (원저자 영문명 역순)
-  710 0_  기관명 부출기입
-  900 10  원저자 한글명 역순 부출기입 (번역서만)
+  원제:        알라딘 API → 알라딘 상품 페이지 크롤링 → Google Books
+  원저자 영문명: 알라딘 상품 페이지 크롤링 → Google Books(원제 검색)
+  한자명:       알라딘 상품 페이지에서 "저자명(漢字名)" 패턴으로 직접 추출
+  동아시아 여부: 알라딘 상품 페이지 국적/출생 키워드로 판별
 """
 
 from flask import Flask, request, jsonify
@@ -62,20 +54,27 @@ ROLE_LABEL = {
 PRIMARY_ROLES = {"지은이", "저자", "글", "글쓴이", ""}
 TRANS_ROLES   = {"옮긴이", "역자", "번역", "편역"}
 
-# 동아시아 저자 판별 키워드 (국적·출생지)
+# 동아시아 저자 판별 키워드
 EAST_ASIA_KEYWORDS = (
-    # 국적
     "일본", "중국", "대만", "홍콩",
-    # 출생지 관련
     "출생", "고향", "태어", "출신",
-    # 일본 지명
     "도쿄", "오사카", "교토", "이와테", "홋카이도", "오키나와",
     "나고야", "후쿠오카", "삿포로", "고베", "요코하마",
-    # 중국 지명
     "베이징", "상하이", "광저우", "타이베이",
-    # 한자 지명
     "東京", "大阪", "京都", "北京", "上海",
 )
+
+# 부제목에서 제거할 마케팅·수상 키워드 패턴
+SUBTITLE_NOISE_PATTERNS = [
+    r"\d{4}\s*일본\s*서점대상.*",
+    r"\d{4}\s*서점대상.*",
+    r"일본\s*서점대상.*",
+    r"\d{4}\s*본야도이상.*",
+    r".*수상작$",
+    r".*수상$",
+    r".*대상\s*\d+위.*",
+    r".*베스트셀러.*",
+]
 
 
 # ─────────────────────────────────────────────
@@ -86,48 +85,62 @@ def is_org(name: str) -> bool:
 
 
 def to_title_case(word: str) -> str:
-    """SAINT-EXUPERY → Saint-Exupery"""
     return "-".join(part.capitalize() for part in word.split("-"))
 
 
 def remove_series(title: str) -> str:
-    """
-    제목에서 총서명(괄호로 묶인 부분) 제거
-    예: "젊은 베르테르의 슬픔 (먼슬리 클래식)" → "젊은 베르테르의 슬픔"
-    """
+    """괄호로 묶인 총서명 제거: "젊은 베르테르의 슬픔 (먼슬리 클래식)" → "젊은 베르테르의 슬픔" """
     return re.sub(r"\s*\([^)]+\)\s*$", "", title).strip()
 
 
 def remove_year(text: str) -> str:
-    """
-    텍스트에서 연도 괄호 제거
-    예: "Die Leiden des Jungen Werther (1774년)" → "Die Leiden des Jungen Werther"
-    """
+    """연도 괄호 제거: "Title (1774년)" → "Title" """
     return re.sub(r"\s*\(\d{4}년?\)\s*$", "", text).strip()
 
 
+def clean_subtitle(subtitle: str) -> str:
+    """
+    부제목에서 마케팅/수상 키워드를 제거합니다.
+    예: "2025 일본 서점대상 1위 수상작" → ""
+        "감동의 소설 - 2025 서점대상 수상작" → "감동의 소설"
+    """
+    if not subtitle:
+        return subtitle
+
+    # 전체가 노이즈 패턴이면 빈 문자열 반환
+    for pattern in SUBTITLE_NOISE_PATTERNS:
+        if re.fullmatch(pattern, subtitle.strip()):
+            return ""
+
+    # 구분자(·, -, |) 뒤에 노이즈가 오면 그 부분만 제거
+    for sep in [" · ", " - ", " | ", " / "]:
+        if sep in subtitle:
+            parts = subtitle.split(sep)
+            cleaned = []
+            for part in parts:
+                is_noise = any(re.fullmatch(p, part.strip()) for p in SUBTITLE_NOISE_PATTERNS)
+                if not is_noise:
+                    cleaned.append(part)
+            if cleaned:
+                return sep.join(cleaned).strip()
+            else:
+                return ""
+
+    return subtitle.strip()
+
+
 def korean_name_reverse(name: str) -> str | None:
-    """
-    한글 이름을 역순으로 변환합니다.
-    성이 앞에 오는 한국식과 이름이 앞에 오는 서양식 한글 표기 모두 처리.
-    예: "요한 볼프강 폰 괴테" → "괴테, 요한 볼프강 폰"
-        (마지막 단어를 성으로 간주)
-    한글이 없으면 None 반환.
-    """
+    """서양식 한글 표기 역순: "요한 볼프강 폰 괴테" → "괴테, 요한 볼프강 폰" """
     if not re.search(r"[\uac00-\ud7a3]", name):
         return None
     parts = name.strip().split()
     if len(parts) < 2:
         return None
-    # 마지막 단어를 성으로 간주
     return f"{parts[-1]}, {' '.join(parts[:-1])}"
 
 
 def english_name_reverse(name: str) -> str:
-    """
-    영문 이름을 역순으로 변환합니다.
-    예: "Johann Wolfgang von Goethe" → "Goethe, Johann Wolfgang von"
-    """
+    """영문 이름 역순: "Johann Wolfgang von Goethe" → "Goethe, Johann Wolfgang von" """
     parts = name.strip().split()
     if len(parts) < 2:
         return name
@@ -178,140 +191,86 @@ def fetch_aladin(isbn: str) -> dict:
 
 
 # ─────────────────────────────────────────────
-# 알라딘 저자 소개 크롤링 — 한자명 추출 + 동아시아 저자 판별
-# ─────────────────────────────────────────────
-# 동아시아 저자 판별 키워드 (출생지·태생 관련)
-EAST_ASIA_KEYWORDS = (
-    "출생", "고향", "태어", "출신", "도쿄", "오사카", "교토", "도쿄도",
-    "베이징", "상하이", "광저우", "타이베이", "홍콩",
-    "東京", "大阪", "京都", "北京", "上海",
-)
-
-def scrape_author_intro(item_id: str, author_name: str) -> dict:
-    """
-    알라딘 저자 소개 페이지에서 한자명과 동아시아 저자 여부를 판별합니다.
-
-    판별 방법:
-    - 상품 페이지에서 AuthorSearch=@숫자 형태의 저자 링크 추출
-    - 저자 소개 페이지에서 국적(일본/중국 등) 또는 출생지 키워드 감지
-      → 동아시아 저자면 900 도치 안 함
-    - 저자명 옆 괄호 안 한자 패턴으로 한자명 추출
-      예: "아베 아키코(阿部曉子)" → "阿部曉子"
-
-    반환: {"is_east_asian": bool, "kanji_name": str|None}
-    """
-    result = {"is_east_asian": False, "kanji_name": None}
-
-    url     = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException:
-        return result
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # 상품 페이지에서 AuthorSearch=@숫자 형태의 저자 링크 추출
-    author_id = None
-    for a_tag in soup.find_all("a", href=re.compile(r"AuthorSearch=")):
-        if author_name in a_tag.get_text():
-            href = a_tag.get("href", "")
-            m = re.search(r"AuthorSearch=([^&\"]+)", href)
-            if m:
-                author_id = m.group(1)  # 예: "%ec%95%84%eb%b2%a0...@1609632" 또는 "@1609632"
-                break
-
-    if not author_id:
-        return result
-
-    # 저자 소개 페이지 요청
-    intro_url = f"https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch={author_id}"
-    try:
-        resp2 = requests.get(intro_url, headers=headers, timeout=10)
-        resp2.raise_for_status()
-        intro_soup = BeautifulSoup(resp2.text, "html.parser")
-        intro_text = intro_soup.get_text()
-    except requests.RequestException:
-        return result
-
-    # ── 동아시아 저자 판별 ──────────────────────────
-    # 국적 필드 또는 출생지 키워드로 판별
-    if any(kw in intro_text for kw in EAST_ASIA_KEYWORDS):
-        result["is_east_asian"] = True
-
-    # ── 한자명 추출 ─────────────────────────────────
-    # 패턴 1: "저자명(漢字名)" 형태 — 저자 소개 상단에 주로 등장
-    kanji_match = re.search(
-        r"[\uac00-\ud7a3\s]+\(([^\)]{2,8})\)",
-        intro_text[:300]
-    )
-    if kanji_match:
-        candidate = kanji_match.group(1).strip()
-        # CJK 문자만 포함된 경우만 채택
-        if re.fullmatch(r"[\u4e00-\u9fff\u3400-\u4dbf\uff00-\uffef]+", candidate):
-            result["kanji_name"] = candidate
-
-    # 패턴 2: 못 찾으면 CJK 2~6자 연속 패턴으로 폴백
-    if not result["kanji_name"]:
-        kanji_matches = re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]{2,6}", intro_text[:400])
-        if kanji_matches:
-            result["kanji_name"] = kanji_matches[0]
-
-    return result
-
-
-# ─────────────────────────────────────────────
 # 알라딘 상품 페이지 크롤링
+# 원제, 원저자 영문명, 한자명, 동아시아 여부를 한 번에 추출
 # ─────────────────────────────────────────────
-def scrape_aladin_page(item_id: str) -> dict:
-    """
-    알라딘 상품 페이지의 '원제' 링크에서 원서명·원저자 영문명을 추출합니다.
-    반환: {"orig_title": str|None, "orig_author_en": str|None}
-    """
-    result = {"orig_title": None, "orig_author_en": None}
-    if not item_id:
-        return result
+ALADIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
-    url     = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
+def scrape_aladin_product(item_id: str, primary_author_name: str) -> dict:
+    """
+    알라딘 상품 페이지를 크롤링해서 원제, 원저자 영문명, 한자명, 동아시아 여부를 추출합니다.
+
+    1. 원제/원저자 영문명: "원제" 링크의 SearchWord 파라미터에서 추출
+       - ALL CAPS 단어 → 원저자명
+       - 나머지 단어  → 원서명
+
+    2. 한자명 + 동아시아 여부: 저자 소개 텍스트에서 직접 추출
+       - "아베 아키코(阿部曉子)" 패턴 → 한자명
+       - 국적/출생지 키워드 → 동아시아 여부
+
+    반환: {
+        "orig_title": str|None,
+        "orig_author_en": str|None,
+        "kanji_name": str|None,
+        "is_east_asian": bool
+    }
+    """
+    result = {
+        "orig_title": None,
+        "orig_author_en": None,
+        "kanji_name": None,
+        "is_east_asian": False,
     }
 
+    url = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=ALADIN_HEADERS, timeout=10)
         resp.raise_for_status()
     except requests.RequestException:
         return result
 
     soup      = BeautifulSoup(resp.text, "html.parser")
-    orig_link = soup.find("a", href=re.compile(r"SearchTarget=Foreign&SearchWord="))
+    page_text = soup.get_text()
 
+    # ── 1. 원제 / 원저자 영문명 ─────────────────────
+    orig_link = soup.find("a", href=re.compile(r"SearchTarget=Foreign&SearchWord="))
     if orig_link:
         href  = orig_link.get("href", "")
         match = re.search(r"SearchWord=([^&\"]+)", href)
         if match:
             raw   = match.group(1).replace("+", " ").strip()
             parts = raw.split()
-
             author_parts = [p for p in parts if re.sub(r"[-']", "", p).isupper() and len(p) > 1]
             title_parts  = [p for p in parts if p not in author_parts]
-
             if title_parts:
                 result["orig_title"] = remove_year(" ".join(title_parts))
             if author_parts:
                 result["orig_author_en"] = " ".join(to_title_case(p) for p in author_parts)
+
+    # ── 2. 한자명 + 동아시아 여부 ───────────────────
+    # 상품 페이지 텍스트에서 "저자명(漢字名)" 패턴 탐색
+    # 예: "아베 아키코(阿部曉子)" 또는 "아베 아키코 (阿部曉子)"
+    if primary_author_name:
+        # 저자명 바로 뒤 괄호 안의 CJK 문자 추출
+        escaped = re.escape(primary_author_name)
+        kanji_match = re.search(
+            escaped + r"\s*\(([^\)]{2,8})\)",
+            page_text
+        )
+        if kanji_match:
+            candidate = kanji_match.group(1).strip()
+            if re.fullmatch(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff]+", candidate):
+                result["kanji_name"] = candidate
+
+    # 동아시아 저자 판별: 페이지 텍스트에서 키워드 감지
+    if any(kw in page_text for kw in EAST_ASIA_KEYWORDS):
+        result["is_east_asian"] = True
 
     return result
 
@@ -319,13 +278,10 @@ def scrape_aladin_page(item_id: str) -> dict:
 # ─────────────────────────────────────────────
 # Google Books — 1차: 한글 제목+저자로 원제 탐색
 # ─────────────────────────────────────────────
-def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
-    """한글 제목 + 저자명으로 Google Books를 검색해 원서명을 찾습니다."""
-    query  = f"{title} {primary_author_name}"
-    params: dict = {"q": query, "maxResults": 5, "langRestrict": "ko"}
+def gbooks_search_by_korean(title: str, author_name: str) -> str | None:
+    params: dict = {"q": f"{title} {author_name}", "maxResults": 5, "langRestrict": "ko"}
     if GBOOKS_API_KEY:
         params["key"] = GBOOKS_API_KEY
-
     try:
         resp = requests.get(GBOOKS_API_URL, params=params, timeout=10)
         resp.raise_for_status()
@@ -336,13 +292,10 @@ def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
     for item in data.get("items", []):
         info    = item.get("volumeInfo", {})
         g_title = info.get("title", "").strip()
-
-        # 한글이 없는 제목 → 원서명으로 채택
         if g_title and not re.search(r"[\uac00-\ud7a3]", g_title):
             sub = info.get("subtitle", "").strip()
             raw = f"{g_title} : {sub}" if sub else g_title
             return remove_year(raw)
-
     return None
 
 
@@ -350,11 +303,9 @@ def gbooks_search_by_korean(title: str, primary_author_name: str) -> str | None:
 # Google Books — 2차: 원제로 원저자 영문명 탐색
 # ─────────────────────────────────────────────
 def gbooks_search_by_orig_title(orig_title: str) -> str | None:
-    """원제로 Google Books를 검색해 원저자 영문명을 찾습니다."""
     params: dict = {"q": f'intitle:"{orig_title}"', "maxResults": 3}
     if GBOOKS_API_KEY:
         params["key"] = GBOOKS_API_KEY
-
     try:
         resp = requests.get(GBOOKS_API_URL, params=params, timeout=10)
         resp.raise_for_status()
@@ -366,65 +317,61 @@ def gbooks_search_by_orig_title(orig_title: str) -> str | None:
         authors = item.get("volumeInfo", {}).get("authors", [])
         if authors:
             return authors[0].strip()
-
     return None
 
 
 # ─────────────────────────────────────────────
 # 원제 · 원저자 수집 메인 로직
 # ─────────────────────────────────────────────
-def collect_orig_info(
-    item: dict,
-    item_id: str,
-    title: str,
-    authors: list[dict],
-) -> dict:
+def collect_orig_info(item: dict, item_id: str, title: str, authors: list[dict]) -> dict:
     """
-    ① 원제: 알라딘 API → 알라딘 크롤링 → Google Books(한글 검색)
-    ② 원저자 영문명: 알라딘 크롤링 → Google Books(원제 검색)
-    반환: {"orig_title": str|None, "orig_author_en": str|None}
+    반환: {
+        "orig_title": str|None,
+        "orig_author_en": str|None,
+        "kanji_name": str|None,
+        "is_east_asian": bool
+    }
     """
-    orig_title:     str | None = None
-    orig_author_en: str | None = None
+    primary_ko = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
+    primary_name = primary_ko[0]["name"] if primary_ko else ""
 
-    # ── ① 원제 ──────────────────────────────────
-    # 1순위: 알라딘 API subInfo.originalTitle
+    # 알라딘 상품 페이지 크롤링 (원제 + 원저자영문 + 한자명 + 동아시아 여부 한번에)
+    scraped = scrape_aladin_product(item_id, primary_name)
+
+    orig_title     = scraped["orig_title"]
+    orig_author_en = scraped["orig_author_en"]
+    kanji_name     = scraped["kanji_name"]
+    is_east_asian  = scraped["is_east_asian"]
+
+    # 알라딘 API subInfo.originalTitle 우선 적용
     sub_info = item.get("subInfo", {})
     if isinstance(sub_info, dict):
         api_orig = sub_info.get("originalTitle", "").strip()
         if api_orig:
             orig_title = remove_year(api_orig)
 
-    # 2순위: 알라딘 상품 페이지 크롤링
-    scraped = scrape_aladin_page(item_id)
-    if not orig_title and scraped["orig_title"]:
-        orig_title = scraped["orig_title"]
-
-    # 크롤링에서 원저자 영문명도 얻었으면 저장
-    if scraped["orig_author_en"]:
-        orig_author_en = scraped["orig_author_en"]
-
-    # 3순위: Google Books — 한글 제목+저자명으로 원제 탐색
+    # 원제 없으면 Google Books로 폴백
     if not orig_title:
-        primary     = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
-        author_name = primary[0]["name"] if primary else ""
-        orig_title  = gbooks_search_by_korean(title, author_name)
+        orig_title = gbooks_search_by_korean(title, primary_name)
 
-    # ── ② 원저자 영문명 ─────────────────────────
-    # 2순위: 원제로 Google Books 재검색
+    # 원저자 영문명 없으면 원제로 Google Books 재검색
     if not orig_author_en and orig_title:
         orig_author_en = gbooks_search_by_orig_title(orig_title)
 
-    return {"orig_title": orig_title, "orig_author_en": orig_author_en}
+    return {
+        "orig_title":     orig_title,
+        "orig_author_en": orig_author_en,
+        "kanji_name":     kanji_name,
+        "is_east_asian":  is_east_asian,
+    }
 
 
 # ─────────────────────────────────────────────
 # MARC 필드 빌더
 # ─────────────────────────────────────────────
 def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
-    # 총서명(괄호) 제거
     a_part    = remove_series(title)
-    b_part    = subtitle.strip() if subtitle else ""
+    b_part    = clean_subtitle(subtitle)  # 마케팅 키워드 제거
     persons   = [a for a in authors if not a["is_org"]]
     primary   = [a for a in persons if a["role"] in PRIMARY_ROLES]
     secondary = [a for a in persons if a["role"] not in PRIMARY_ROLES]
@@ -455,7 +402,6 @@ def build_245(title: str, subtitle: str, authors: list[dict]) -> str:
 
 
 def build_246(orig_title: str | None) -> str | None:
-    """246 19 — 원서명 (연도 제거)"""
     if not orig_title:
         return None
     return f"246 19 $a {remove_year(orig_title.strip())}"
@@ -463,9 +409,8 @@ def build_246(orig_title: str | None) -> str | None:
 
 def build_500(orig_author_en: str | None, kanji_name: str | None = None) -> str | None:
     """
-    500 __ — 원저자명 주기 (이름 정순, 구두점 없음)
-    한자명이 있으면 함께 표기
-    예: 500 __ $a 원저자명: Akiko Abe (阿部曉子)
+    500 __ $a 원저자명: Akiko Abe (阿部曉子)
+    한자명만 있을 때: 500 __ $a 원저자명: 阿部曉子
     """
     if not orig_author_en and not kanji_name:
         return None
@@ -476,38 +421,30 @@ def build_500(orig_author_en: str | None, kanji_name: str | None = None) -> str 
 
 
 def build_700(author: dict) -> str:
-    """700 1_ — 개인명 부출 (이름 뒤 구두점 없음)"""
     name = author["name"].strip()
-    # 영문 이름이면 역순 변환
     if re.search(r"[A-Za-z]", name) and not re.search(r"[\uac00-\ud7a3]", name):
         name = english_name_reverse(name)
     return f"$a {name}"
 
 
 def build_700_orig(orig_author_en: str) -> str | None:
-    """700 1_ — 원저자 영문명 역순 부출 (이름 뒤 구두점 없음)"""
     if not orig_author_en:
         return None
     return f"700 1_ $a {english_name_reverse(orig_author_en)}"
 
 
 def build_710(author: dict) -> str:
-    """710 0_ — 기관명 부출 (이름 뒤 구두점 없음)"""
     return f"$a {author['name'].strip()}"
 
 
 def build_900(orig_author_ko: str | None, is_east_asian: bool = False) -> str | None:
     """
-    900 10 — 원저자 한글명 부출 (번역서만)
-    - 동아시아 저자(일본·중국 등): 성이 이미 앞에 오므로 도치 안 함
-      예: "아베 아키코" → "900 10 $a 아베 아키코"
-    - 서양 저자: 마지막 단어를 성으로 간주해 역순 변환
-      예: "요한 볼프강 폰 괴테" → "900 10 $a 괴테, 요한 볼프강 폰"
+    동아시아 저자: 도치 안 함  "아베 아키코" → "900 10 $a 아베 아키코"
+    서양 저자:    도치 함      "요한 볼프강 폰 괴테" → "900 10 $a 괴테, 요한 볼프강 폰"
     """
     if not orig_author_ko:
         return None
     if is_east_asian:
-        # 동아시아 저자는 도치 없이 그대로
         return f"900 10 $a {orig_author_ko.strip()}"
     reversed_name = korean_name_reverse(orig_author_ko)
     if not reversed_name:
@@ -571,23 +508,18 @@ def isbn_lookup():
         orig_info      = collect_orig_info(item, item_id, title, authors)
         orig_title     = orig_info["orig_title"]
         orig_author_en = orig_info["orig_author_en"]
+        kanji_name     = orig_info["kanji_name"]
+        is_east_asian  = orig_info["is_east_asian"]
 
-        # 원저자 한글명: 알라딘 authors 중 PRIMARY 역할 첫 번째
         primary_ko = [a for a in authors if not a["is_org"] and a["role"] in PRIMARY_ROLES]
         if primary_ko:
             orig_author_ko = primary_ko[0]["name"]
-
-            # 저자 소개 크롤링 — 동아시아 여부 + 한자명
-            intro = scrape_author_intro(item_id, orig_author_ko)
-            is_east_asian = intro["is_east_asian"]
-            kanji_name    = intro["kanji_name"]
 
     # ── MARC 필드 생성 ──────────────────────────────
     field_245 = build_245(title, subtitle, authors)
     field_246 = build_246(orig_title)
     field_500 = build_500(orig_author_en, kanji_name)
 
-    # 700: 원저자 영문 역순 부출 + 나머지 저자들
     persons    = [a for a in authors if not a["is_org"]]
     fields_700 = []
     if orig_author_en:
@@ -597,7 +529,6 @@ def isbn_lookup():
     orgs       = [a for a in authors if a["is_org"]]
     fields_710 = [f"710 0_ {build_710(a)}" for a in orgs]
 
-    # 900: 원저자 한글명 부출 (동아시아 저자면 도치 안 함)
     field_900  = build_900(orig_author_ko, is_east_asian)
     fields_900 = [field_900] if field_900 else []
 
