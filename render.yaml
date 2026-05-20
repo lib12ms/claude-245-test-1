@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: kormarc-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    # 합저는 저자 프로필 HTTP가 많음 — 타임아웃 짧으면 Render/HTML 502·504가 납니다.
+    # Render 공개 URL은 ~30초 제한 — ISBN 조회는 알라딘·국중 병렬·국중 예산(NLK_FETCH_BUDGET_SEC)으로 맞춤
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120 --graceful-timeout 60 app:app
+    envVars:
+      - key: ALADIN_API_KEY
+        sync: false
+      - key: NLK_API_KEY
+        sync: false
+      # 구 대화에서 쓰던 이름 — 둘 중 하나만 설정해도 됨
+      - key: NL_API_KEY
+        sync: false
