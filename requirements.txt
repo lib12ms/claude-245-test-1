@@ -9,3 +9,4 @@ jaconv>=0.3
 # Streamlit Cloud가 기본으로 읽는 requirements.txt에 streamlit이 없으면
 # "streamlit: command not found" 로 앱이 뜨지 않습니다.
 streamlit>=1.28.0
+google-generativeai>=0.4.0
