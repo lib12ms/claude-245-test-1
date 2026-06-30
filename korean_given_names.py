@@ -49,6 +49,16 @@ def korean_given_names() -> frozenset[str]:
     return frozenset(korean_given_name_weights().keys())
 
 
+@lru_cache(maxsize=1)
+def korean_given_name_syllables() -> frozenset[str]:
+    """등록된 이름에 쓰인 모든 음절 집합. 2음절 이름 폴백 판별용."""
+    syllables: set[str] = set()
+    for name in korean_given_names():
+        for ch in name:
+            syllables.add(ch)
+    return frozenset(syllables)
+
+
 def korean_given_name_weight(given: str) -> int | None:
     g = (given or "").strip()
     if not g:
@@ -69,15 +79,21 @@ def korean_given_name_is_plausible(
 ) -> bool:
     """
     700 1_ 에 쓸 만한 등록 이름인지.
+    - 1글자: 통계 등장 + 출생 건수 합이 min_single_char_weight 이상
     - 2글자: 통계에 등장하면 True
-    - 1글자: 등장 + 출생 건수 합이 min_single_char_weight 이상
+      통계에 없어도(2008 이전 전통 이름 등) 두 음절이 모두 알려진 이름에
+      쓰인 음절이면 True (병기·재호 등 구세대 이름 오탈락 방지)
     """
     g = (given or "").strip()
     if not g:
         return False
     w = korean_given_name_weight(g)
-    if w is None:
-        return False
-    if len(g) == 1:
-        return w >= min_single_char_weight
-    return True
+    if w is not None:
+        if len(g) == 1:
+            return w >= min_single_char_weight
+        return True
+    # 2음절 이름이 통계 목록에 없을 때: 개별 음절이 모두 알려진 이름 음절이면 실제 이름으로 간주
+    if len(g) == 2:
+        syllables = korean_given_name_syllables()
+        return all(ch in syllables for ch in g)
+    return False
